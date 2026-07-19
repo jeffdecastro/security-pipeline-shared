@@ -53,7 +53,12 @@ jobs:
             dest="_scanner_output/${artifact}"
             mkdir -p "$dest"
             gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" --name "$artifact" --dir "$dest" || true
-            file=$(find "$dest" -type f | head -n1)
+            # artifacts can bundle a human-readable report (.html) alongside the
+            # machine-readable one (.json/.sarif/.jsonl) - always prefer the latter
+            file=$(find "$dest" -type f \( -name "*.json" -o -name "*.sarif" -o -name "*.jsonl" \) | head -n1)
+            if [ -z "$file" ]; then
+              file=$(find "$dest" -type f | head -n1)
+            fi
             if [ -n "$file" ]; then
               args="${args} ${key}=${file}"
             fi
