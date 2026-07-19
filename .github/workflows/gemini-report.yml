@@ -71,16 +71,6 @@ jobs:
           python3 _shared/scripts/normalize.py ${{ steps.fetch.outputs.parser_args }} > normalized-findings.json
           cat normalized-findings.json
 
-      - name: DEBUG raw generateContent call via curl
-        continue-on-error: true
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$GEMINI_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d '{"contents":[{"parts":[{"text":"say hi"}]}]}'
-
       - name: Generate Gemini report and post PR comment
         continue-on-error: true
         env:
