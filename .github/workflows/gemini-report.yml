@@ -71,6 +71,14 @@ jobs:
           python3 _shared/scripts/normalize.py ${{ steps.fetch.outputs.parser_args }} > normalized-findings.json
           cat normalized-findings.json
 
+      - name: DEBUG list available Gemini models
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print([m['name'] for m in d.get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]) if 'models' in d else print(d)"
+
       - name: Generate Gemini report and post PR comment
         continue-on-error: true
         env:
