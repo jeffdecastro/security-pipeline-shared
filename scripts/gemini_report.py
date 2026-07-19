@@ -4,10 +4,11 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 
 MARKER = "<!-- gemini-security-report -->"
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
 PROMPT_TEMPLATE = """You are a security engineer writing a pull request comment for other developers.
@@ -51,8 +52,12 @@ def call_gemini(api_key, findings):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        result = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"::error::Gemini API error {e.code}: {e.read().decode()}", file=sys.stderr)
+        raise
     return result["candidates"][0]["content"]["parts"][0]["text"]
 
 
