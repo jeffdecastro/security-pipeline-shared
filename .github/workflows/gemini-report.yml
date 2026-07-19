@@ -52,7 +52,7 @@ jobs:
             artifact="${pair#*=}"
             dest="_scanner_output/${artifact}"
             mkdir -p "$dest"
-            gh run download "${{ github.run_id }}" --name "$artifact" --dir "$dest" || true
+            gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" --name "$artifact" --dir "$dest" || true
             file=$(find "$dest" -type f | head -n1)
             if [ -n "$file" ]; then
               args="${args} ${key}=${file}"

@@ -69,13 +69,13 @@ def upsert_pr_comment(repo, pr_number, body_text):
         comment_id = existing[-1]
         subprocess.run(
             ["gh", "api", f"repos/{repo}/issues/comments/{comment_id}", "-X", "PATCH",
-             "-f", f"body=@{body_file}"],
+             "-F", f"body=@{body_file}"],
             check=True,
         )
     else:
         subprocess.run(
             ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "-X", "POST",
-             "-f", f"body=@{body_file}"],
+             "-F", f"body=@{body_file}"],
             check=True,
         )
 
