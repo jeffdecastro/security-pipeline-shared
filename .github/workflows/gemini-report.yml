@@ -1,0 +1,80 @@
+name: Gemini Security Report (reusable)
+
+# Called by downstream repos' security workflows. Downloads scanner-output
+# artifacts already uploaded earlier in the SAME calling workflow run,
+# normalizes them into one schema, and asks Gemini to turn that into a
+# dev-readable, CWE-aware, risk-prioritized PR comment. Never fails the
+# caller's build — every step is continue-on-error.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+      artifact_manifest:
+        description: >
+          Comma-separated list of parser-key=artifact-name pairs, e.g.
+          "semgrep-sarif=semgrep-output,trivy-sarif=trivy-output,nuclei-jsonl=nuclei-results"
+        required: true
+        type: string
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+jobs:
+  gemini-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout shared scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: jeffdecastro/security-pipeline-shared
+          ref: main
+          path: _shared
+
+      - name: Download scanner artifacts and build parser args
+        id: fetch
+        continue-on-error: true
+        env:
+          MANIFEST: ${{ inputs.artifact_manifest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p _scanner_output
+          args=""
+          IFS=',' read -ra PAIRS <<< "$MANIFEST"
+          for pair in "${PAIRS[@]}"; do
+            key="${pair%%=*}"
+            artifact="${pair#*=}"
+            dest="_scanner_output/${artifact}"
+            mkdir -p "$dest"
+            gh run download "${{ github.run_id }}" --name "$artifact" --dir "$dest" || true
+            file=$(find "$dest" -type f | head -n1)
+            if [ -n "$file" ]; then
+              args="${args} ${key}=${file}"
+            fi
+          done
+          echo "parser_args=${args}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Normalize findings
+        continue-on-error: true
+        run: |
+          python3 _shared/scripts/normalize.py ${{ steps.fetch.outputs.parser_args }} > normalized-findings.json
+          cat normalized-findings.json
+
+      - name: Generate Gemini report and post PR comment
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 _shared/scripts/gemini_report.py normalized-findings.json
