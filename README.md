@@ -10,9 +10,14 @@ CI pipelines *after* those pipelines have already run their own scanners
 build artifacts. This repo does not run any scanners itself — it only
 normalizes, summarizes, and comments.
 
-It is currently consumed by [`jeffdecastro/WebGoatJeff`](https://github.com/jeffdecastro/WebGoatJeff)'s
-`security-scan.yml` workflow as an experimental, second PR comment running
-alongside that repo's own deterministic findings report.
+Every comment carries two parts: a Gemini-written narrative that prioritizes
+by real-world risk, and a **generated inventory of every finding** that is
+built in code. The narrative is a reading aid; the inventory is the record.
+See [why](#the-generated-inventory-why-the-model-is-not-trusted-for-completeness).
+
+It is currently exercised by [`jeffdecastro/DVWA`](https://github.com/jeffdecastro/DVWA)'s
+`security-scan.yml`, which runs Semgrep (SAST), Trivy (SCA), and OWASP ZAP
+(DAST) and calls this workflow to produce one combined comment.
 
 ---
 
@@ -676,6 +681,11 @@ To support a new scanner (e.g. Bandit, Gitleaks, OWASP Dependency-Check):
 - **DAST findings have no line number and often no file**, by nature of
   the tools (Nuclei/ZAP operate over HTTP, not source) — `file` is
   overloaded to mean "URL/host" for those tools, and `line` is always `0`.
+- **DAST results are not reproducible run to run.** Two consecutive ZAP runs
+  against the same DVWA commit produced 23 and 24 alerts. Crawl order, timing,
+  and which pages respond all vary, so finding counts drift even when nothing
+  changed. SAST/SCA counts are stable; do not treat a DAST count delta between
+  runs as evidence that the code changed.
 - **The Gemini call is not covered by live tests.** The test suite mocks the
   API; only the request construction and response handling are verified
   offline.
@@ -755,3 +765,29 @@ new parser's CWE and severity mappings land where you expect.
 
 `.github/workflows/test.yml` runs the unit suite plus a CLI smoke test on
 Python 3.11 and 3.12 for every push and pull request.
+
+### Validation record
+
+The pipeline has been exercised live end to end against `jeffdecastro/DVWA`,
+not only through mocks:
+
+| Run | Scanners | Raw → deduped | Result |
+|---|---|---|---|
+| SAST + SCA | Semgrep 85, Trivy 7 | 92 → 90 | Comment posted; matched the local dry run exactly |
+| Re-run, same PR | same | 92 → 90 | Comment **PATCHed in place** — upsert verified, no duplicate |
+| SAST + SCA + DAST | + ZAP 23 | 115 → 113 | Comment posted, but the model silently omitted all 23 DAST findings |
+| After the inventory fix | + ZAP 24 | 116 → 114 | All 12 ZAP CWE classes present; inventory rows = finding count |
+
+The third row is why [the generated
+inventory](#the-generated-inventory-why-the-model-is-not-trusted-for-completeness)
+exists. It was only observable with a real model on a mixed SAST/DAST finding
+set — the mocked test suite could not have caught it.
+
+Two paths remain **unverified in production** and are covered by unit tests
+only:
+
+- The `parse_zap` empty-`instances[]` fix. Neither live ZAP run produced that
+  shape (`alerts with empty instances[]: 0` both times). The DVWA caller logs
+  this count on every run so the first real occurrence is visible.
+- The Gemini retry/backoff path, which has not been triggered by a real
+  429 or 5xx.
