@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for gemini_report.py. Run: python3 -m unittest discover -s tests -v"""
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -280,6 +281,73 @@ class TestUpsert(unittest.TestCase):
                 gr.upsert_pr_comment("o/r", "5", "body")
         self.assertTrue(created)
         self.assertFalse(any(Path(p).exists() for p in created))
+
+
+class TestMain(unittest.TestCase):
+    """Regression cover for a missing GEMINI_API_KEY posting no comment at all.
+
+    Discovered wiring the shared pipeline into a repo that had never had the
+    secret configured: with findings present but no key, main() used to
+    sys.exit(1) before ever calling upsert_pr_comment, so the run showed green
+    (continue-on-error) with zero visible signal that nothing was posted."""
+
+    def _findings_file(self, findings):
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump(findings, f)
+        f.close()
+        return f.name
+
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {
+            "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "5",
+        }, clear=False)
+        self.env.start()
+        os.environ.pop("GEMINI_API_KEY", None)
+        self.addCleanup(self.env.stop)
+
+    def test_missing_key_with_findings_still_posts_a_comment(self):
+        path = self._findings_file([finding()])
+        with mock.patch.object(gr, "upsert_pr_comment") as up, \
+             self.assertRaises(SystemExit) as ctx, \
+             mock.patch.object(sys, "argv", ["gemini_report.py", path]):
+            gr.main()
+        up.assert_called_once()
+        body = up.call_args.args[2]
+        self.assertIn("GEMINI_API_KEY", body)
+        self.assertIn("CWE-89", body)  # the inventory, not just the excuse text
+        self.assertEqual(ctx.exception.code, 1)  # step shows failed, but posted
+
+    def test_missing_key_with_no_findings_posts_the_normal_no_findings_comment(self):
+        path = self._findings_file([])
+        with mock.patch.object(gr, "upsert_pr_comment") as up:
+            with mock.patch.object(sys, "argv", ["gemini_report.py", path]):
+                gr.main()  # returns normally, no key needed when nothing to report
+        self.assertIn("No security findings", up.call_args.args[2])
+
+    def test_gemini_failure_also_still_posts_and_exits_nonzero(self):
+        path = self._findings_file([finding()])
+        os.environ["GEMINI_API_KEY"] = "k"
+        with mock.patch.object(gr, "call_gemini", side_effect=RuntimeError("503")), \
+             mock.patch.object(gr, "upsert_pr_comment") as up, \
+             self.assertRaises(SystemExit) as ctx:
+            with mock.patch.object(sys, "argv", ["gemini_report.py", path]):
+                gr.main()
+        up.assert_called_once()
+        self.assertIn("CWE-89", up.call_args.args[2])
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_successful_call_exits_zero(self):
+        path = self._findings_file([finding()])
+        os.environ["GEMINI_API_KEY"] = "k"
+        with mock.patch.object(gr, "call_gemini", return_value="## narrative"), \
+             mock.patch.object(gr, "upsert_pr_comment"):
+            with mock.patch.object(sys, "argv", ["gemini_report.py", path]):
+                try:
+                    gr.main()
+                    code = 0
+                except SystemExit as e:
+                    code = e.code
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

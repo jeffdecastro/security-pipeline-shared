@@ -333,23 +333,39 @@ def main():
                           f"{MARKER}\n### No security findings to report for this PR.")
         return
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        log("::error::GEMINI_API_KEY not set")
-        sys.exit(1)
-    prompt, included, total = build_prompt(findings)
-    log(f"sending {included}/{total} finding(s) to {MODEL}")
-
     appendix = build_appendix(findings)
-    try:
-        report = sanitize_report(call_gemini(api_key, prompt))
-    except RuntimeError as e:
-        # The generated inventory is still worth posting without the narrative.
-        log(f"::warning::Gemini call failed ({e}); posting inventory only")
+    api_key = os.environ.get("GEMINI_API_KEY")
+    exit_code = 0
+
+    if not api_key:
+        # A missing key used to exit(1) before building anything, so a
+        # misconfigured caller (secret not passed through, typo'd secret name)
+        # posted no comment at all - the same silent-failure shape the
+        # inventory was built to close for a failed API call. Treat it the
+        # same way: the inventory is still worth posting.
+        log("::error::GEMINI_API_KEY not set")
         report = ("### Security scan summary\n\n_The AI narrative could not be "
-                  "generated for this run. The complete scanner inventory is below._")
+                  "generated: `GEMINI_API_KEY` is not configured for this "
+                  "repository/workflow. The complete scanner inventory is below._")
+        exit_code = 1
+    else:
+        prompt, included, total = build_prompt(findings)
+        log(f"sending {included}/{total} finding(s) to {MODEL}")
+        try:
+            report = sanitize_report(call_gemini(api_key, prompt))
+        except RuntimeError as e:
+            # The generated inventory is still worth posting without the narrative.
+            log(f"::warning::Gemini call failed ({e}); posting inventory only")
+            report = ("### Security scan summary\n\n_The AI narrative could not be "
+                      "generated for this run. The complete scanner inventory is below._")
+            exit_code = 1
 
     upsert_pr_comment(repo, pr_number, compose_body(report, appendix))
+    # continue-on-error in the caller swallows this, but a non-zero exit still
+    # marks the step failed in the Actions UI - a real signal that the
+    # narrative half of the report didn't run, worth seeing even though a
+    # comment was still posted.
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
