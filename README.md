@@ -32,6 +32,7 @@ alongside that repo's own deterministic findings report.
 - [How a calling repo wires this in](#how-a-calling-repo-wires-this-in)
 - [Failure philosophy: never break the caller's build](#failure-philosophy-never-break-the-callers-build)
 - [Permissions and secrets handling](#permissions-and-secrets-handling)
+- [Threat model and hardening](#threat-model-and-hardening)
 - [Extending: adding a new scanner parser](#extending-adding-a-new-scanner-parser)
 - [Known limitations](#known-limitations)
 - [Local development / testing](#local-development--testing)
@@ -210,12 +211,16 @@ security-pipeline-shared/
 ├── scripts/
 │   ├── normalize.py              # SARIF / JSONL / tool-JSON -> common schema
 │   └── gemini_report.py          # prompt building, Gemini call, PR comment upsert
+├── tests/
+│   ├── test_normalize.py         # parser, CWE, severity, dedupe, clamping tests
+│   └── test_gemini_report.py     # retry, sanitizer, budget, upsert tests
 └── README.md                     # this file
 ```
 
-There is no build step, no dependency manifest, and no test suite in this
-repo today — both scripts are dependency-free stdlib Python 3.12 and are
-invoked directly by the workflow.
+There is no build step and no dependency manifest — both scripts are
+dependency-free stdlib Python 3.12 and are invoked directly by the workflow.
+The test suite uses only `unittest` from the standard library and mocks all
+network and `gh` calls, so it runs offline with no credentials.
 
 ---
 
@@ -229,7 +234,8 @@ executes when another workflow references it with `uses:`.
 | Input | Type | Required | Description |
 |---|---|---|---|
 | `pr_number` | `string` | yes | The pull request number to comment on. The caller is responsible for only invoking this on PR-triggered runs (see the `if: github.event_name == 'pull_request'` guard in the example caller). |
-| `artifact_manifest` | `string` | yes | Comma-separated `parser-key=artifact-name` pairs, e.g. `semgrep-sarif=semgrep-output,trivy-sarif=trivy-output,nuclei-jsonl=nuclei-results`. The `parser-key` must match a key in `normalize.py`'s `PARSERS` dict; the `artifact-name` must match the `name:` used in the caller's `actions/upload-artifact` step. |
+| `artifact_manifest` | `string` | yes | Comma-separated `parser-key=artifact-name` pairs, e.g. `semgrep-sarif=semgrep-output,trivy-sarif=trivy-output,nuclei-jsonl=nuclei-results`. The `parser-key` must match a key in `normalize.py`'s `PARSERS` dict; the `artifact-name` must match the `name:` used in the caller's `actions/upload-artifact` step. Every entry is validated against `^[a-z0-9-]+=[A-Za-z0-9._-]+$` before use and the job fails fast on a malformed entry. |
+| `shared_ref` | `string` | no (default `main`) | Ref of this repo to check out for the scripts. Pin to a tag or commit SHA for reproducible runs; see [Known limitations](#known-limitations). |
 
 ### Secrets
 
@@ -242,28 +248,42 @@ executes when another workflow references it with `uses:`.
 The job `gemini-report` runs on `ubuntu-latest` with a 10-minute timeout and
 requests only `contents: read` + `pull-requests: write`.
 
-1. **Checkout shared scripts** — checks out *this* repo (`main`) into a
-   `_shared/` subdirectory of the caller's workspace, so the caller doesn't
-   need to vendor these scripts itself. Pinned to a specific
-   `actions/checkout` commit SHA (`9c091bb2...` / tagged `v7.0.0`).
-2. **Download scanner artifacts and build parser args** (`id: fetch`,
+1. **Validate inputs** — the only step that is *not* `continue-on-error`.
+   Asserts `pr_number` is numeric and that every `artifact_manifest` entry
+   matches `^[a-z0-9-]+=[A-Za-z0-9._-]+$`. This runs before anything else so
+   a malformed manifest fails loudly instead of silently producing no
+   comment, and so no unvalidated value ever reaches `gh run download`.
+2. **Checkout shared scripts** — checks out *this* repo (`inputs.shared_ref`,
+   default `main`) into a `_shared/` subdirectory of the caller's workspace,
+   so the caller doesn't need to vendor these scripts itself. Pinned to a
+   specific `actions/checkout` commit SHA (`9c091bb2...` / tagged `v7.0.0`),
+   with `persist-credentials: false` so no token is left in `_shared/.git`.
+3. **Download scanner artifacts and build parser args** (`id: fetch`,
    `continue-on-error: true`) — parses `artifact_manifest`, and for each
-   pair calls `gh run download <run_id> --name <artifact>`. Failures per
-   artifact are swallowed (`|| true`) so a missing artifact (e.g. because an
-   upstream scan step failed) doesn't abort the whole job — it's simply
-   omitted from the `parser_args` output.
-3. **Set up Python** — `actions/setup-python@v6`, Python `3.12`.
-4. **Normalize findings** (`continue-on-error: true`) — runs
-   `_shared/scripts/normalize.py` with the `parser_args` built above,
-   writing `normalized-findings.json` and echoing it to the log for
+   pair calls `gh run download <run_id> --name <artifact>`. A missing
+   artifact (e.g. because an upstream scan step failed) logs a `::warning::`
+   and is skipped rather than aborting the job. Every machine-readable file
+   found in each artifact is queued (not just the first), and the resulting
+   `parser-key=path` entries are written **NUL-delimited to
+   `parser_args.txt`** rather than to a step output — see
+   [Threat model and hardening](#threat-model-and-hardening).
+4. **Set up Python** — `actions/setup-python@v6`, Python `3.12`.
+5. **Normalize findings** (`continue-on-error: true`) — runs
+   `_shared/scripts/normalize.py --args-file parser_args.txt`, writing
+   `normalized-findings.json` and echoing the first 200 lines to the log for
    debuggability.
-5. **Generate Gemini report and post PR comment**
+6. **Generate Gemini report and post PR comment**
    (`continue-on-error: true`) — runs `_shared/scripts/gemini_report.py`
    against `normalized-findings.json`, using `GEMINI_API_KEY`, `GH_TOKEN`
    (`github.token`), and `PR_NUMBER` from the environment.
 
-Every step after checkout is `continue-on-error: true` — see
+Every step after validation is `continue-on-error: true` — see
 [Failure philosophy](#failure-philosophy-never-break-the-callers-build).
+
+The workflow declares a top-level `permissions: {}` (the job re-grants only
+what it needs) and a `concurrency` group keyed on repo + PR number, so two
+runs racing on the same PR cannot both decide "no comment exists yet" and
+each POST one, which would defeat the upsert.
 
 ---
 
@@ -286,18 +306,35 @@ flat shape, one object per finding, in a single JSON array:
 
 | Field | Type | Notes |
 |---|---|---|
-| `tool` | string | One of `semgrep`, `trivy`, `nuclei`, `brakeman`, `zap` — set by the parser, not read from the scanner output. |
-| `cwe` | string | Normalized to `CWE-<number>`, or the literal string `CWE-UNKNOWN` when the scanner didn't supply one (this is common for Nuclei). |
+| `tool` | string | One of `semgrep`, `trivy`, `nuclei`, `brakeman`, `zap` — set by the parser, not read from the scanner output. After dedupe this may be a comma-joined, alphabetically sorted list (e.g. `semgrep,trivy`) when several tools reported the same finding. |
+| `cwe` | string | Always exactly `CWE-<number>` or the literal `CWE-UNKNOWN`. Scanners spell this inconsistently — Semgrep emits `"CWE-89: Improper Neutralization of…"`, ZAP and Brakeman emit bare numbers (`"79"`, `[89]`) — so all forms are reduced to the bare id. |
 | `severity` | string | One of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO` (`SEVERITY_ORDER`). Mapped from each tool's native scale — see the matrix below. This value is **authoritative** and Gemini is explicitly instructed not to change it. |
-| `file` | string | File path (SAST), or matched URL/host (DAST tools like Nuclei/ZAP, which have no file concept). |
-| `line` | integer | Source line, or `0` when not applicable (DAST findings). |
-| `rule_id` | string | Scanner-specific rule/check identifier or template name. |
-| `description` | string | Free-text human-readable explanation from the scanner. |
+| `file` | string | File path (SAST), or matched URL/host (DAST tools like Nuclei/ZAP, which have no file concept). Clamped to 500 characters. |
+| `line` | integer | Source line, or `0` when not applicable (DAST findings). Non-numeric or negative values normalize to `0`. |
+| `rule_id` | string | Scanner-specific rule/check identifier or template name. For Trivy this is the CVE id (e.g. `CVE-2026-45133`). Clamped to 500 characters. |
+| `description` | string | Free-text human-readable explanation from the scanner. Clamped to 1000 characters (Trivy embeds full CVE prose, which is otherwise unbounded prompt cost). |
+
+Every string field is passed through a clamp that strips control characters
+and enforces a length cap. Scanner output echoes source code, file paths, and
+URLs, all of which can be attacker-influenced on a fork PR; without this a
+finding could embed a newline followed by `::error::` and forge a GitHub
+Actions workflow command when the normalized JSON is printed to the run log.
+
+### Deduplication
+
+`normalize.py` deduplicates before emitting. Findings are keyed on
+`(cwe, file, line, rule_id)`; collisions merge into one record that keeps the
+**highest** severity seen and joins the reporting tool names. The output array
+is then sorted by severity (`CRITICAL` first), then CWE, file, and line.
+
+That ordering is load-bearing: `gemini_report.py` truncates the findings array
+from the end when it exceeds the prompt budget, so truncation always drops the
+least severe findings first.
 
 This schema is the entire contract between "raw scanner output" and "what
-Gemini sees." It's deliberately minimal — no severity scores, no
-fingerprints/dedup keys, no remediation guidance — those are left to Gemini
-to reason about at report-generation time from the fields above.
+Gemini sees." It's deliberately minimal — no severity scores, no remediation
+guidance — those are left to Gemini to reason about at report-generation time
+from the fields above.
 
 ---
 
@@ -305,16 +342,24 @@ to reason about at report-generation time from the fields above.
 
 | Parser key | Format | Native severity signal | Mapping to normalized `severity` |
 |---|---|---|---|
-| `semgrep-sarif` | SARIF | `result.level` (`error`/`warning`/`note`), or `security-severity` score on the rule if present | `security-severity` ≥9 → `CRITICAL`, ≥7 → `HIGH`, ≥4 → `MEDIUM`, else `LOW`; otherwise `error`→`HIGH`, `warning`→`MEDIUM`, `note`→`LOW`, default `MEDIUM` |
+| `semgrep-sarif` | SARIF | `result.level` (`error`/`warning`/`note`), or `security-severity` score on the rule if present | `security-severity` ≥9 → `CRITICAL`, ≥7 → `HIGH`, ≥4 → `MEDIUM`, else `LOW`; otherwise `error`→`HIGH`, `warning`→`MEDIUM`, `note`→`LOW`, default `MEDIUM`. A non-numeric `security-severity` falls back to the level rather than raising. |
 | `trivy-sarif` | SARIF | same SARIF logic as above (Trivy is run with `format: sarif` in the caller) | same as above |
-| `nuclei-jsonl` | JSON Lines (one finding per line) | `info.severity` (nuclei's own scale: `critical`/`high`/`medium`/`low`/`info`) | Uppercased directly; falls back to `INFO` if the value isn't recognized. Empty/missing file is treated as zero findings (not an error). |
-| `brakeman-json` | JSON (`warnings[]`) | `confidence` (`High`/`Medium`/`Weak`) | `High`→`HIGH`, `Medium`→`MEDIUM`, `Weak`→`LOW`, default `MEDIUM`. `cwe_id` is a list; only the first entry is used. |
-| `zap-json` | JSON (`site[].alerts[]`) | `riskcode` (`"3"`/`"2"`/`"1"`/`"0"`) | `"3"`→`HIGH`, `"2"`→`MEDIUM`, `"1"`→`LOW`, `"0"`→`INFO`, default `LOW`. `cweid` of `null` or `"-1"` becomes `CWE-UNKNOWN`. Only the first `instances[]` entry's URI is used as `file`. |
+| `sarif` | SARIF | generic passthrough for any other SARIF producer | same as above; findings are labelled `tool: "sarif"` |
+| `nuclei-jsonl` | JSON Lines, **or** a single JSON array (`-json` vs `-jsonl`) | `info.severity` (nuclei's own scale: `critical`/`high`/`medium`/`low`/`info`) | Uppercased directly; falls back to `INFO` if the value isn't recognized. CWE is read from `info.classification.cwe-id`. Empty/missing file is treated as zero findings. A single malformed line is logged and skipped; the remaining lines still parse. |
+| `brakeman-json` | JSON (`warnings[]`) | `confidence` (`High`/`Medium`/`Weak`) | `High`→`HIGH`, `Medium`→`MEDIUM`, `Weak`→`LOW`, default `MEDIUM`. `cwe_id` is accepted as either a list (first usable entry wins) or a bare scalar. |
+| `zap-json` | JSON (`site[].alerts[]`) | `riskcode` (`"3"`/`"2"`/`"1"`/`"0"`) | `"3"`→`HIGH`, `"2"`→`MEDIUM`, `"1"`→`LOW`, `"0"`→`INFO`, default `LOW`. `cweid` of `null`, `-1`, or `0` becomes `CWE-UNKNOWN`. The first `instances[]` URI is used as `file`, falling back to the site name when `instances` is absent **or an empty list** (common on passive-scan-only runs). |
 
 Notes:
 
 - SARIF parsing (`parse_sarif`) is shared between Semgrep and Trivy — the
   only difference is the `tool_name` label attached to each finding.
+- **Trivy SARIF carries no CWE data at all** (its rule `properties` are only
+  `precision`, `security-severity`, and `tags`), so Trivy findings normalize
+  to `CWE-UNKNOWN` by design. The CVE id is preserved in `rule_id`, which is
+  the more useful identifier for dependency findings anyway.
+- Every parser tolerates structurally wrong input — a non-object top level, a
+  `runs`/`results`/`alerts` value that isn't a list, or `null` entries inside
+  one — and yields the findings it can rather than raising.
 - Any `parser-key` in `artifact_manifest` that isn't in the `PARSERS` dict
   produces a `::warning::` annotation and is skipped, not a hard failure.
 - Any per-file parse exception is caught, logged as a `::warning::`, and
@@ -323,6 +368,8 @@ Notes:
 - A missing file (path doesn't exist) is silently skipped — this is the
   normal case when an artifact wasn't produced (e.g. a scan step failed
   upstream and `continue-on-error` let the job proceed with no output).
+- Per-file parse counts are logged to stderr, so the run log shows how many
+  findings each artifact contributed and how many survived dedupe.
 
 ---
 
@@ -348,10 +395,48 @@ instructs the model to:
 - **Stay skimmable** — markdown headers, tables, and collapsible
   `<details>` sections for the long tail of low-severity items.
 - **Emit only the comment body** — no "Here is the comment" preamble.
+- **Emit no HTML comments, `<script>`, `<iframe>`, or `<img>` tags.**
 
 If the normalized findings array is empty, Gemini is never called — the
 script short-circuits to a fixed `"### No security findings to report for
 this PR."` comment.
+
+### Prompt budget
+
+The findings array is embedded in the prompt directly, so it is bounded twice:
+at most `MAX_FINDINGS_IN_PROMPT` (300) findings, and at most
+`MAX_FINDINGS_CHARS` (300,000) characters of serialized JSON. Because
+`normalize.py` sorts by severity, truncation drops the least severe findings
+first. When anything is dropped, the prompt tells the model how many findings
+existed in total and instructs it to state the truncation in the comment, so a
+truncated report is never silently mistaken for a complete one.
+
+### Transport and retries
+
+`call_gemini` retries up to 4 times with exponential backoff plus jitter on
+`429`/`5xx` and on network/timeout errors. Non-retryable client errors (`4xx`
+other than 429) and safety blocks fail immediately rather than burning quota.
+
+The response is parsed defensively: a safety block, an empty `candidates`
+array, or a candidate with no `parts` (which is what a `MAX_TOKENS` or
+`SAFETY` finish produces) raises a descriptive `RuntimeError` instead of an
+opaque `KeyError`.
+
+### Output sanitization
+
+Gemini's output is treated as **untrusted**, because it is a summary of
+scanner findings that themselves quote attacker-influenceable source code.
+Before the text is posted, `sanitize_report` strips HTML comments and active
+markup (`<script>`, `<iframe>`, `<object>`, `<embed>`, `<form>`, `<meta>`,
+`<base>`, `<link>`). Stripping HTML comments specifically prevents the model
+from emitting the upsert marker itself, which would let one run's comment
+hijack or orphan another's. Ordinary markdown — headers, tables, and
+`<details>`/`<summary>` blocks — is preserved.
+
+The final body is then truncated to GitHub's hard 65,536-character limit for
+issue comments, with a visible truncation notice appended. Without this an
+oversized report is rejected by the API and the run produces no comment at
+all.
 
 ### Comment upsert
 
@@ -463,10 +548,59 @@ and check the Action run logs directly if you suspect it silently no-op'd.
   it is only ever read into an environment variable for the single
   `gemini_report.py` process and is never echoed, logged, or written to a
   file.
-- The Gemini API key is sent as a query parameter
-  (`?key={api_key}`) on an HTTPS request to
-  `generativelanguage.googleapis.com`, per Google's documented API surface
-  for this endpoint — it is not embedded in the request body or headers.
+- The Gemini API key is sent in the `x-goog-api-key` **request header**, not
+  as a `?key=` query parameter. Both are supported by Google, but a query
+  string tends to leak: it shows up in `urllib` exception messages and
+  tracebacks, and in any intermediary that logs request lines.
+
+---
+
+## Threat model and hardening
+
+The trust boundary here is subtle. This workflow never executes the caller's
+code, but it does process data derived from it: scanner output quotes source
+snippets, file paths, and URLs from the pull request under review. On a fork
+PR, all of that is attacker-controlled. Three sinks matter.
+
+**1. Artifact paths reaching a shell.** The `fetch` step discovers files
+inside downloaded artifacts with `find`, so those paths are attacker-shaped.
+Passing them through a step output and interpolating that output into a later
+`run:` block — `python3 normalize.py ${{ steps.fetch.outputs.parser_args }}` —
+is a command-injection sink: GitHub Actions substitutes the value as *literal
+text* into the script before `bash` parses it, so a file named
+`x$(id).sarif` executes `id`. Two changes close this:
+
+- Paths are written **NUL-delimited to `parser_args.txt`** and read by
+  `normalize.py --args-file`. They never pass through a step output and are
+  never word-split or expanded by a shell. NUL delimiting also means paths
+  containing spaces or newlines round-trip intact.
+- `artifact_manifest` is validated against a strict charset before any entry
+  reaches `gh run download --name`.
+
+All `run:` blocks use `set -euo pipefail` and read caller-controlled values
+from `env:` rather than `${{ }}` interpolation.
+
+**2. Findings text reaching the run log and the model.** Every normalized
+string field is stripped of control characters and length-clamped, so a
+finding cannot forge an Actions workflow command (`::error::`, `::add-mask::`)
+when the normalized JSON is echoed to the log. The findings JSON is fenced in
+the prompt between explicit delimiters and preceded by an instruction to treat
+its contents as inert data — the model is told that scanner text may claim to
+be a system message or an override and must be ignored.
+
+This mitigates but does not eliminate prompt injection. The structural
+defenses are what actually bound the damage: severities are copied verbatim
+from `normalize.py` output and never taken from the model, and the model's
+output is sanitized before posting.
+
+**3. Model output reaching a PR comment.** See
+[Output sanitization](#output-sanitization) — the marker cannot be forged and
+active markup is stripped.
+
+Also addressed: the workflow declares `permissions: {}` at the top level,
+checkout uses `persist-credentials: false`, and a `concurrency` group
+serializes runs per PR so the comment upsert cannot race itself into
+duplicate comments.
 
 ---
 
@@ -490,25 +624,52 @@ To support a new scanner (e.g. Bandit, Gitleaks, OWASP Dependency-Check):
 
 ## Known limitations
 
-- **No test suite.** `normalize.py` and `gemini_report.py` are exercised
-  only via live CI runs against real scanner output today.
 - **`@main` pinning.** The example caller references this workflow via
   `@main` rather than a pinned tag/SHA, so changes here take effect
   immediately in downstream callers on their next run — there is currently
-  no versioned release process.
-- **Single LLM call per run, no retries.** `call_gemini` does not retry on
-  transient API errors; a failure simply drops that run's report (see
-  [Failure philosophy](#failure-philosophy-never-break-the-callers-build)).
-- **No pagination handling on very large findings sets.** The entire
-  normalized findings array is embedded directly in the prompt text with no
-  chunking, truncation, or token-budget check.
+  no versioned release process. The `shared_ref` input lets a caller pin the
+  *scripts*, but the `uses:` reference to the workflow itself still has to be
+  pinned by the caller.
+- **Truncation over chunking.** Very large findings sets are truncated to the
+  prompt budget rather than chunked across multiple LLM calls and merged. The
+  comment says so explicitly when it happens, but the long tail is dropped.
+- **Prompt injection is mitigated, not solved.** Instructional defenses in
+  the prompt are best-effort. The guarantees that actually hold are
+  structural: severities come from `normalize.py` and are never read back
+  from the model, and model output is sanitized before posting. A determined
+  injection could still influence the *prose* of the summary.
+- **Dedupe is exact-match, not fuzzy.** Findings are keyed on
+  `(cwe, file, line, rule_id)`. Two tools describing the same issue with
+  different rule ids or off-by-one line numbers still appear twice; the
+  prompt asks Gemini to merge those semantically.
+- **Trivy findings carry no CWE**, so they all group under `CWE-UNKNOWN`.
+  Their CVE id is in `rule_id`.
 - **DAST findings have no line number and often no file**, by nature of
   the tools (Nuclei/ZAP operate over HTTP, not source) — `file` is
   overloaded to mean "URL/host" for those tools, and `line` is always `0`.
+- **The Gemini call is not covered by live tests.** The test suite mocks the
+  API; only the request construction and response handling are verified
+  offline.
 
 ---
 
 ## Local development / testing
+
+### Running the tests
+
+No dependencies, no network, no credentials:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The suite covers each parser's happy path and its malformed-input paths, CWE
+normalization across all three scanner spellings, severity mapping bands,
+field clamping, dedupe/ordering, the Gemini retry and response-parsing logic,
+output sanitization, the prompt and comment size budgets, and temp-file
+cleanup on failure.
+
+### Running the scripts
 
 Both scripts are dependency-free Python 3.12 and can be run directly:
 
@@ -518,6 +679,10 @@ python3 scripts/normalize.py \
   semgrep-sarif=./semgrep.sarif \
   nuclei-jsonl=./nuclei-results.json \
   > normalized-findings.json
+
+# Or the way the workflow invokes it, with a NUL-delimited args file
+printf 'semgrep-sarif=%s\0trivy-sarif=%s\0' ./semgrep.sarif ./trivy.sarif > args.txt
+python3 scripts/normalize.py --args-file args.txt > normalized-findings.json
 
 # Generate a report locally (requires network + a real Gemini key)
 export GEMINI_API_KEY=...
@@ -531,3 +696,33 @@ Note that `gemini_report.py`'s `upsert_pr_comment` step will make real
 `gh api` calls against `GITHUB_REPOSITORY`/`PR_NUMBER` if you run it
 locally with a valid `GH_TOKEN` — point it at a scratch repo/PR rather than
 a production one when testing.
+
+### Generating realistic fixtures
+
+The unit tests use synthetic inputs. To exercise the parsers against real
+scanner output, point the scanners at a deliberately vulnerable app —
+[DVWA](https://github.com/digininja/DVWA) and
+[OWASP Juice Shop](https://github.com/juice-shop/juice-shop) both produce a
+useful spread of CWEs:
+
+```bash
+git clone --depth 1 https://github.com/digininja/DVWA /tmp/DVWA
+
+semgrep scan --config=p/default --sarif --output=/tmp/dvwa-semgrep.sarif /tmp/DVWA
+trivy fs --format sarif --scanners vuln,secret,misconfig \
+  --output /tmp/dvwa-trivy.sarif /tmp/DVWA
+
+printf 'semgrep-sarif=%s\0trivy-sarif=%s\0' \
+  /tmp/dvwa-semgrep.sarif /tmp/dvwa-trivy.sarif > /tmp/args.txt
+python3 scripts/normalize.py --args-file /tmp/args.txt | jq -r '.[].cwe' | sort | uniq -c | sort -rn
+```
+
+DVWA should surface `CWE-89` (SQL injection), `CWE-78` (OS command
+injection), and `CWE-94` (code injection) among the top groups; Juice Shop
+adds `CWE-798` (hardcoded credentials). Both are useful for confirming that a
+new parser's CWE and severity mappings land where you expect.
+
+### CI
+
+`.github/workflows/test.yml` runs the unit suite plus a CLI smoke test on
+Python 3.11 and 3.12 for every push and pull request.

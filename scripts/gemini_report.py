@@ -2,14 +2,29 @@
 """Send normalized findings to Gemini and post (or update) a PR comment with the result."""
 import json
 import os
+import random
+import re
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 
 MARKER = "<!-- gemini-security-report -->"
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+
+# GitHub rejects issue-comment bodies over 65536 characters outright, which
+# would otherwise turn a large-findings PR into a silent no-comment run.
+GITHUB_COMMENT_LIMIT = 65536
+# Keep the prompt well inside the model's context. Findings are pre-sorted by
+# severity in normalize.py, so truncation always drops the least severe first.
+MAX_FINDINGS_IN_PROMPT = 300
+MAX_FINDINGS_CHARS = 300_000
+
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 4
 
 PROMPT_TEMPLATE = """You are a security engineer writing a pull request comment for other developers.
 
@@ -25,10 +40,11 @@ Rules you MUST follow:
 - Produce a "Risk-based priority" ordering at the top: a short ranked list of the 3-5 things to fix first, with a one-line reason each (e.g. "internet-reachable", "confirmed by dynamic scan", "known CVE with public exploit", "auth bypass path").
 - Keep the whole comment concise and skimmable: use markdown headers, tables, and collapsible <details> sections for the long tail of low-severity items.
 - Do not include any text outside the markdown comment itself (no preamble like "Here is the comment").
+- Do not emit HTML comments (`<!-- ... -->`), `<script>`, `<iframe>`, or `<img>` tags.
 
 Repository: {repo}
 PR: #{pr_number}
-
+{truncation_note}
 Findings JSON:
 <<<FINDINGS_JSON_START>>>
 {findings_json}
@@ -36,77 +52,203 @@ Findings JSON:
 """
 
 
-def call_gemini(api_key, findings):
-    prompt = PROMPT_TEMPLATE.format(
+def log(msg):
+    print(msg, file=sys.stderr)
+
+
+def build_prompt(findings):
+    """Render the prompt, truncating the findings array to a bounded size."""
+    total = len(findings)
+    included = findings[:MAX_FINDINGS_IN_PROMPT]
+    findings_json = json.dumps(included, indent=2)
+
+    while len(findings_json) > MAX_FINDINGS_CHARS and len(included) > 1:
+        included = included[: len(included) // 2]
+        findings_json = json.dumps(included, indent=2)
+
+    if len(included) < total:
+        note = (
+            f"\nNOTE: {total} findings were produced; only the {len(included)} "
+            f"highest-severity ones are included below. State this truncation "
+            f"explicitly in your comment.\n"
+        )
+    else:
+        note = ""
+    return PROMPT_TEMPLATE.format(
         repo=os.environ.get("GITHUB_REPOSITORY", "unknown"),
         pr_number=os.environ.get("PR_NUMBER", "unknown"),
-        findings_json=json.dumps(findings, indent=2),
-    )
+        truncation_note=note,
+        findings_json=findings_json,
+    ), len(included), total
+
+
+def _extract_text(result):
+    """Pull the model text out of a generateContent response, or explain why not.
+
+    A safety block or a MAX_TOKENS stop returns a candidate with no `parts`,
+    so indexing blindly raises KeyError and drops the whole report.
+    """
+    feedback = result.get("promptFeedback") or {}
+    if feedback.get("blockReason"):
+        raise RuntimeError(f"Gemini blocked the prompt: {feedback['blockReason']}")
+
+    candidates = result.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Gemini returned no candidates")
+
+    candidate = candidates[0]
+    parts = (candidate.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+    if not text:
+        raise RuntimeError(
+            f"Gemini returned no text (finishReason={candidate.get('finishReason')!r})"
+        )
+    return text
+
+
+def call_gemini(api_key, prompt):
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
     }).encode()
-    req = urllib.request.Request(
-        f"{API_URL}?key={api_key}",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        print(f"::error::Gemini API error {e.code}: {e.read().decode()}", file=sys.stderr)
-        raise
-    return result["candidates"][0]["content"]["parts"][0]["text"]
+
+    last_error = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            API_URL,
+            data=body,
+            # Sent as a header, not a ?key= query param: a query string ends up
+            # in exception messages, proxy logs, and urllib tracebacks.
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return _extract_text(json.loads(resp.read()))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:500]
+            last_error = f"HTTP {e.code}: {detail}"
+            if e.code not in RETRY_STATUSES:
+                break
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            last_error = f"{type(e).__name__}: {e}"
+        except RuntimeError as e:
+            # A safety block is deterministic; retrying just burns quota.
+            raise
+
+        if attempt < MAX_ATTEMPTS:
+            delay = min(2 ** attempt, 16) + random.uniform(0, 1)
+            log(f"::warning::Gemini attempt {attempt}/{MAX_ATTEMPTS} failed ({last_error}); retrying in {delay:.1f}s")
+            time.sleep(delay)
+
+    raise RuntimeError(f"Gemini API failed after {MAX_ATTEMPTS} attempt(s): {last_error}")
+
+
+def sanitize_report(text):
+    """Neutralize model output before it is posted as a PR comment.
+
+    The model's output is untrusted: the findings it summarizes contain
+    attacker-influenceable source snippets. Strip HTML comments so it cannot
+    forge the upsert marker (which would let one run hijack or orphan another
+    run's comment), and defang active markup GitHub might render.
+    """
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"(?is)<\s*/?\s*(script|iframe|object|embed|form|meta|base|link)\b[^>]*>", "", text)
+    return text.strip()
+
+
+def truncate_for_github(body):
+    if len(body) <= GITHUB_COMMENT_LIMIT:
+        return body
+    notice = "\n\n---\n_Report truncated: exceeded GitHub's 65536-character comment limit._"
+    return body[: GITHUB_COMMENT_LIMIT - len(notice)] + notice
+
+
+def _gh(args, **kwargs):
+    result = subprocess.run(["gh", *args], capture_output=True, text=True, **kwargs)
+    if result.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:2])} failed: {result.stderr.strip()[:500]}")
+    return result.stdout
 
 
 def upsert_pr_comment(repo, pr_number, body_text):
-    full_body = f"{MARKER}\n{body_text}"
-    existing = subprocess.run(
-        ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
-         "--jq", f'.[] | select(.body | startswith("{MARKER}")) | .id'],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip().splitlines()
+    full_body = truncate_for_github(f"{MARKER}\n{body_text}")
 
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-        f.write(full_body)
-        body_file = f.name
+    existing = _gh([
+        "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
+        "--jq", '.[] | select(.body | startswith("<!-- gemini-security-report -->")) | .id',
+    ]).strip().splitlines()
 
-    if existing:
-        comment_id = existing[-1]
-        subprocess.run(
-            ["gh", "api", f"repos/{repo}/issues/comments/{comment_id}", "-X", "PATCH",
-             "-F", f"body=@{body_file}"],
-            check=True,
-        )
-    else:
-        subprocess.run(
-            ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "-X", "POST",
-             "-F", f"body=@{body_file}"],
-            check=True,
-        )
+    body_file = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as f:
+            f.write(full_body)
+            body_file = f.name
+
+        if existing:
+            comment_id = existing[-1].strip()
+            _gh(["api", f"repos/{repo}/issues/comments/{comment_id}", "-X", "PATCH",
+                 "-F", f"body=@{body_file}"])
+            log(f"updated existing comment {comment_id}")
+        else:
+            _gh(["api", f"repos/{repo}/issues/{pr_number}/comments", "-X", "POST",
+                 "-F", f"body=@{body_file}"])
+            log("posted new comment")
+    finally:
+        if body_file:
+            try:
+                os.unlink(body_file)
+            except OSError:
+                pass
+
+
+def load_findings(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log(f"::warning::{path} not found — treating as zero findings")
+        return []
+    except json.JSONDecodeError as e:
+        log(f"::warning::{path} is not valid JSON ({e}) — treating as zero findings")
+        return []
+    if not isinstance(data, list):
+        log(f"::warning::{path} is not a JSON array — treating as zero findings")
+        return []
+    return [f for f in data if isinstance(f, dict)]
 
 
 def main():
     if len(sys.argv) != 2:
-        print("usage: gemini_report.py <normalized-findings.json>", file=sys.stderr)
+        log("usage: gemini_report.py <normalized-findings.json>")
+        sys.exit(2)
+
+    missing = [v for v in ("GITHUB_REPOSITORY", "PR_NUMBER") if not os.environ.get(v)]
+    if missing:
+        log(f"::error::missing required environment variable(s): {', '.join(missing)}")
         sys.exit(1)
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("::error::GEMINI_API_KEY not set", file=sys.stderr)
-        sys.exit(1)
-
-    findings = json.loads(open(sys.argv[1]).read())
     repo = os.environ["GITHUB_REPOSITORY"]
     pr_number = os.environ["PR_NUMBER"]
+    if not re.fullmatch(r"[0-9]+", pr_number):
+        log(f"::error::PR_NUMBER must be numeric, got {pr_number!r}")
+        sys.exit(1)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
+        log(f"::error::GITHUB_REPOSITORY is not a valid owner/repo, got {repo!r}")
+        sys.exit(1)
+
+    findings = load_findings(sys.argv[1])
 
     if not findings:
         report = "### No security findings to report for this PR."
     else:
-        report = call_gemini(api_key, findings)
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            log("::error::GEMINI_API_KEY not set")
+            sys.exit(1)
+        prompt, included, total = build_prompt(findings)
+        log(f"sending {included}/{total} finding(s) to {MODEL}")
+        report = sanitize_report(call_gemini(api_key, prompt))
 
     upsert_pr_comment(repo, pr_number, report)
 
