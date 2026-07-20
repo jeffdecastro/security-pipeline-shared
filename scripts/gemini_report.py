@@ -22,6 +22,10 @@ GITHUB_COMMENT_LIMIT = 65536
 # severity in normalize.py, so truncation always drops the least severe first.
 MAX_FINDINGS_IN_PROMPT = 300
 MAX_FINDINGS_CHARS = 300_000
+# Space reserved for the generated finding inventory appended to every comment.
+APPENDIX_BUDGET = 30_000
+
+SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 4
@@ -157,11 +161,96 @@ def sanitize_report(text):
     return text.strip()
 
 
+def _cell(text):
+    """Escape a value for use inside a markdown table cell."""
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def build_appendix(findings):
+    """Render a complete, deterministic inventory of every finding.
+
+    The LLM decides what to feature in its narrative, and in practice it drops
+    the low-severity tail entirely - a live run summarized 90 SAST findings and
+    silently omitted all 23 DAST ones while still calling itself a "detailed
+    breakdown". Completeness cannot depend on the model, so the counts and the
+    full table below are generated in code and appended unconditionally.
+    """
+    by_sev = {}
+    by_tool = {}
+    for f in findings:
+        by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
+        for tool in str(f["tool"]).split(","):
+            by_tool[tool] = by_tool.get(tool, 0) + 1
+
+    sev_cells = " · ".join(
+        f"**{s}** {by_sev[s]}" for s in SEVERITY_ORDER if s in by_sev
+    ) or "none"
+    tool_cells = " · ".join(f"`{t}` {by_tool[t]}" for t in sorted(by_tool)) or "none"
+
+    lines = [
+        "---",
+        "",
+        "### Scanner inventory (generated, not model-written)",
+        "",
+        f"**{len(findings)} finding(s)** after deduplication.",
+        "",
+        f"By severity: {sev_cells}",
+        "",
+        f"By tool: {tool_cells}",
+        "",
+        "<details>",
+        "<summary>Full finding list</summary>",
+        "",
+        "| Severity | CWE | Tool | Location | Rule |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    header_len = sum(len(x) + 1 for x in lines)
+    rows = []
+    used = 0
+    omitted = 0
+    for f in findings:
+        loc = _cell(f["file"]) + (f":{f['line']}" if f.get("line") else "")
+        row = (f"| {_cell(f['severity'])} | {_cell(f['cwe'])} | {_cell(f['tool'])} "
+               f"| `{loc}` | {_cell(f['rule_id'])} |")
+        if header_len + used + len(row) + 1 > APPENDIX_BUDGET:
+            omitted += 1
+            continue
+        used += len(row) + 1
+        rows.append(row)
+
+    lines.extend(rows)
+    if omitted:
+        lines.append(f"")
+        lines.append(f"_{omitted} further finding(s) omitted from this table for length; "
+                     f"the counts above are complete._")
+    lines.extend(["", "</details>"])
+    return "\n".join(lines)
+
+
 def truncate_for_github(body):
     if len(body) <= GITHUB_COMMENT_LIMIT:
         return body
     notice = "\n\n---\n_Report truncated: exceeded GitHub's 65536-character comment limit._"
     return body[: GITHUB_COMMENT_LIMIT - len(notice)] + notice
+
+
+def compose_body(report, appendix):
+    """Join the model narrative and the generated appendix within GitHub's limit.
+
+    The appendix is the authoritative part, so if the whole thing is too long
+    the *narrative* is trimmed and the appendix is kept intact.
+    """
+    full = f"{MARKER}\n{report}\n\n{appendix}"
+    if len(full) <= GITHUB_COMMENT_LIMIT:
+        return full
+
+    notice = "\n\n_[narrative truncated for length; the inventory below is complete]_\n"
+    overhead = len(MARKER) + 1 + len(notice) + 2 + len(appendix)
+    room = GITHUB_COMMENT_LIMIT - overhead
+    if room <= 0:
+        # Appendix alone fills the comment; keep it and drop the narrative.
+        return truncate_for_github(f"{MARKER}\n{appendix}")
+    return f"{MARKER}\n{report[:room]}{notice}\n{appendix}"
 
 
 def _gh(args, **kwargs):
@@ -171,8 +260,8 @@ def _gh(args, **kwargs):
     return result.stdout
 
 
-def upsert_pr_comment(repo, pr_number, body_text):
-    full_body = truncate_for_github(f"{MARKER}\n{body_text}")
+def upsert_pr_comment(repo, pr_number, full_body):
+    full_body = truncate_for_github(full_body)
 
     existing = _gh([
         "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
@@ -240,17 +329,27 @@ def main():
     findings = load_findings(sys.argv[1])
 
     if not findings:
-        report = "### No security findings to report for this PR."
-    else:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            log("::error::GEMINI_API_KEY not set")
-            sys.exit(1)
-        prompt, included, total = build_prompt(findings)
-        log(f"sending {included}/{total} finding(s) to {MODEL}")
-        report = sanitize_report(call_gemini(api_key, prompt))
+        upsert_pr_comment(repo, pr_number,
+                          f"{MARKER}\n### No security findings to report for this PR.")
+        return
 
-    upsert_pr_comment(repo, pr_number, report)
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        log("::error::GEMINI_API_KEY not set")
+        sys.exit(1)
+    prompt, included, total = build_prompt(findings)
+    log(f"sending {included}/{total} finding(s) to {MODEL}")
+
+    appendix = build_appendix(findings)
+    try:
+        report = sanitize_report(call_gemini(api_key, prompt))
+    except RuntimeError as e:
+        # The generated inventory is still worth posting without the narrative.
+        log(f"::warning::Gemini call failed ({e}); posting inventory only")
+        report = ("### Security scan summary\n\n_The AI narrative could not be "
+                  "generated for this run. The complete scanner inventory is below._")
+
+    upsert_pr_comment(repo, pr_number, compose_body(report, appendix))
 
 
 if __name__ == "__main__":

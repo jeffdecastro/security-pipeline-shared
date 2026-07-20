@@ -433,6 +433,30 @@ from emitting the upsert marker itself, which would let one run's comment
 hijack or orphan another's. Ordinary markdown — headers, tables, and
 `<details>`/`<summary>` blocks — is preserved.
 
+### The generated inventory (why the model is not trusted for completeness)
+
+Every comment ends with a **`Scanner inventory` section built in code, not by
+the model**: total finding count, a breakdown by severity and by tool, and a
+collapsible table of every finding.
+
+This exists because of an observed failure, not a hypothetical one. In a live
+run against DVWA with 113 findings (90 SAST + 23 DAST), the model wrote a
+report covering the SAST findings and silently omitted **all 23 ZAP findings** —
+11 distinct CWE classes, including four `MEDIUM`s — while describing itself as
+"a detailed breakdown of the findings". Nothing in the output signalled the
+omission.
+
+Instructing the model to use `<details>` for the long tail does not fix this;
+it simply chose not to. So completeness is now a code guarantee:
+
+- The counts are always exact, even if the table itself is trimmed for length.
+- If the combined comment exceeds GitHub's limit, the **narrative** is
+  truncated and the inventory is preserved — the authoritative part survives.
+- If the Gemini call fails entirely, the inventory is still posted with a note
+  that the narrative could not be generated.
+
+Treat the model's prose as a reading aid and the inventory as the record.
+
 The final body is then truncated to GitHub's hard 65,536-character limit for
 issue comments, with a visible truncation notice appended. Without this an
 oversized report is rejected by the API and the run produces no comment at
@@ -638,6 +662,11 @@ To support a new scanner (e.g. Bandit, Gitleaks, OWASP Dependency-Check):
   structural: severities come from `normalize.py` and are never read back
   from the model, and model output is sanitized before posting. A determined
   injection could still influence the *prose* of the summary.
+- **The model's narrative is not complete and should not be read as such.**
+  It demonstrably drops findings — see
+  [the generated inventory](#the-generated-inventory-why-the-model-is-not-trusted-for-completeness).
+  The appended inventory is the authoritative list; the prose above it is a
+  prioritization aid.
 - **Dedupe is exact-match, not fuzzy.** Findings are keyed on
   `(cwe, file, line, rule_id)`. Two tools describing the same issue with
   different rule ids or off-by-one line numbers still appear twice; the
