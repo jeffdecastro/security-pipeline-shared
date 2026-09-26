@@ -7,7 +7,7 @@ Status: **approved 2026-09-26 ("yes to all": every recommendation in §7).**
 | 0 Prerequisites | implemented, awaiting review |
 | 1 SAST | not started |
 | 2 SCA | not started |
-| 3 Analysis | not started. Needs the exact model id and your key's RPD/RPM (Q5), plus WebGoatJeff's ref (Q7) |
+| 3 Analysis | not started. Model default decided (see Q5 below, pending one check against your key). Still needs WebGoatJeff's ref (Q7) |
 Base: `ae4c89d` (+ `2d4f930`, which only adds `docs/CAPABILITIES.md`).
 
 Marking used throughout: **(verified)** means I read the source or ran it.
@@ -629,11 +629,61 @@ Whether DAST belongs in this repo at all is covered in §8.
 | Q2 | Is it acceptable that the narrative becomes code-rendered from structured model output (a different look from today's prose)? | Yes. It's what makes "severity never from the model" structural |
 | Q3 | Should Stage 0 (marker-author fix, cell escaping, README drift, tag `v1.0.0`) land before Stage 1? | Yes. Stage 3's short-circuit depends on it |
 | Q4 | Keep scanners as separate opt-in workflows (option A), or not build scanner execution at all (option C)? | A if you want it; see §8 for the case for C |
-| Q5 | Which model, and what are your key's actual RPD/RPM (AI Studio → Rate limits)? Are any callers **private repos**? Google's free-tier terms allow prompts to be used to improve Google's products, which matters if private vulnerability details are sent | Pin an explicit Flash or Flash-Lite id. Paid tier or no LLM for private repos |
+| Q5 *(partly answered 2026-09-26; see §7.1)* | Which model, and what are your key's actual RPD/RPM (AI Studio → Rate limits)? Are any callers **private repos**? Google's free-tier terms allow prompts to be used to improve Google's products, which matters if private vulnerability details are sent | Pin an explicit Flash or Flash-Lite id. Paid tier or no LLM for private repos |
 | Q6 | Stdlib-only, reporting-only, no gating. Are all three confirmed for this work? | Yes. No gating is added in any stage |
 | Q7 | Can you give read access to WebGoatJeff, or confirm its ref and manifest? | Needed before Stage 3 merges |
 
 ---
+
+### 7.1 Q5 findings: model and limits
+
+**Callers are public repos** (your answer). The free-tier data-use concern
+doesn't apply: the scanned code is already public.
+
+**Model.** I couldn't read Google's docs. `ai.google.dev`, `blog.google`,
+and `docs.cloud.google.com` are all blocked by this environment's egress
+proxy, and your key's limits are only visible in AI Studio.
+
+What I could establish:
+
+| Fact | Source | Confidence |
+|---|---|---|
+| `gemini-flash-latest` is what Google's own SDK README uses (45 times) | `googleapis/python-genai` README, read in this session | verified |
+| The alias moves to each new Flash release, with ~2 weeks' notice | secondary sources | (unverified) |
+| The newest Flash is `gemini-3.8-flash`, released 2026-09-02, so the alias most likely points there now | search results that cite Google Cloud docs and blog.google | (unverified) |
+| Free tier: newest Flash models (3.5–3.8) ≈ **20 RPD**. Flash-Lite (3.1 / 3.5) ≈ **500 RPD** | secondary sources, several agreeing | (unverified) |
+| ~20 RPD on the Flash alias matches this repo's history: `gemini-2.5-flash` was "blocked for this key tier" (`33ca0fa`) | repo history | consistent |
+| Thinking control is `thinkingConfig.thinkingLevel` (`MINIMAL`/`LOW`/`MEDIUM`/`HIGH`) or `thinkingBudget` (0 = disabled, allowed range model-dependent) | `python-genai` `types.py` L375-386, L5773-5786, read in this session | verified. Which models accept which field is (unverified) |
+
+**Decision:**
+- The default model becomes **Flash-Lite, pinned by exact id**, exposed as
+  a validated workflow input `gemini_model` (regex
+  `^gemini-[a-z0-9.-]{1,60}$`) so a caller can override it.
+- Why Flash-Lite:
+  - the Stage 3 task (enum annotations over ~15 compact classes) is well
+    within Flash-Lite's ability;
+  - it has about 25× the daily quota (≈500 vs ≈20 RPD);
+  - a pinned id stops Google from silently changing the model and its
+    thinking parameters underneath us.
+- The exact id (probably `gemini-3.5-flash-lite`) is confirmed against your
+  key with the one-off check below before Stage 3 merges. It is not assumed.
+- Thinking is set to the minimum level the pinned model accepts. Stage 3's
+  first CI-independent check is one real call with that config.
+
+**One-off check you run locally** (read-only, a single `models.list` call,
+key sent as a header):
+
+```bash
+read -rs GEMINI_API_KEY   # paste the key, press Enter; stays out of shell history
+curl -sS -H "x-goog-api-key: $GEMINI_API_KEY" \
+  "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200" \
+  | python3 -c 'import json,sys; [print(m["name"]) for m in json.load(sys.stdin).get("models",[]) if "generateContent" in m.get("supportedGenerationMethods",[]) and "flash" in m["name"]]'
+```
+
+Then open **AI Studio → Dashboard → Usage/Rate limits**. Note the RPM and RPD
+next to the Flash-Lite id from the list, and next to whatever
+`gemini-flash-latest` resolves to. `models.list` doesn't return quotas; only
+AI Studio shows them.
 
 ## 8. Honest advice
 
