@@ -191,7 +191,7 @@ class TestAppendix(unittest.TestCase):
         # narrative would typically drop them
         self.assertIn("zap", appendix)
         self.assertIn("CWE-693", appendix)
-        self.assertIn("http://127.0.0.1:4280", appendix)
+        self.assertIn("<code>http://127.0.0.1:4280</code>", appendix)
 
     def test_counts_are_complete_even_when_table_is_truncated(self):
         findings = [{"tool": "semgrep", "cwe": "CWE-89", "severity": "HIGH",
@@ -228,6 +228,37 @@ class TestAppendix(unittest.TestCase):
         appendix = gr.build_appendix([])
         self.assertIn("0 finding(s)", appendix)
 
+    def _row(self, **overrides):
+        f = dict({"tool": "semgrep", "cwe": "CWE-1", "severity": "LOW", "file": "a.php",
+                  "line": 3, "rule_id": "r", "description": "d"}, **overrides)
+        return [l for l in gr.build_appendix([f]).splitlines() if l.startswith("| LOW")][0]
+
+    def test_backtick_in_path_cannot_break_out_of_code(self):
+        # The location used to sit in a `code span`: one backtick in a
+        # scanner-reported path closed it and let the rest render as markdown.
+        row = self._row(file="x`**bold** [click](https://evil.example)`.php")
+        self.assertNotIn("`", row)
+        self.assertNotIn("**", row)
+        self.assertNotIn("](", row)
+
+    def test_html_in_rule_id_is_inert(self):
+        row = self._row(rule_id='<img src=x onerror=alert(1)><!-- gemini-security-report -->')
+        self.assertNotIn("<img", row)
+        self.assertNotIn("<!--", row)
+        self.assertIn("&lt;img", row)
+
+    def test_mentions_and_refs_are_neutralized(self):
+        # An @name or #123 in a rule id would otherwise ping a user or
+        # cross-link an issue from the bot's comment.
+        row = self._row(rule_id="@octocat fixes #1")
+        self.assertNotIn("@octocat", row)
+        self.assertNotIn("#1", row)
+        self.assertIn("<code>", row)
+
+    def test_newline_in_field_stays_on_one_row(self):
+        row = self._row(file="a\n| INJECTED | row |")
+        self.assertIn("a &#124; INJECTED", row)
+
 
 class TestComposeBody(unittest.TestCase):
     def test_appendix_survives_when_narrative_is_oversized(self):
@@ -260,11 +291,38 @@ class TestUpsert(unittest.TestCase):
         self.assertIn("POST", m.call_args_list[-1].args[0])
 
     def test_patches_when_marker_comment_exists(self):
-        with mock.patch.object(gr, "_gh", side_effect=["123\n456\n", ""]) as m:
+        listing = "123\tgithub-actions[bot]\n456\tgithub-actions[bot]\n"
+        with mock.patch.object(gr, "_gh", side_effect=[listing, ""]) as m:
             gr.upsert_pr_comment("o/r", "5", "body")
         args = m.call_args_list[-1].args[0]
         self.assertIn("PATCH", args)
         self.assertIn("repos/o/r/issues/comments/456", args)
+
+    def test_marker_comment_by_another_author_is_never_patched(self):
+        # Anyone can post a comment that starts with the marker. The bot used
+        # to PATCH the latest such comment - an attacker's, if they posted last.
+        listing = "123\tgithub-actions[bot]\n456\tmallory\n"
+        with mock.patch.object(gr, "_gh", side_effect=[listing, ""]) as m:
+            gr.upsert_pr_comment("o/r", "5", "body")
+        args = m.call_args_list[-1].args[0]
+        self.assertIn("repos/o/r/issues/comments/123", args)
+        self.assertNotIn("repos/o/r/issues/comments/456", args)
+
+    def test_only_foreign_marker_comments_means_post_new(self):
+        with mock.patch.object(gr, "_gh", side_effect=["456\tmallory\n", ""]) as m:
+            gr.upsert_pr_comment("o/r", "5", "body")
+        self.assertIn("POST", m.call_args_list[-1].args[0])
+
+    def test_listing_query_filters_on_marker_and_returns_author(self):
+        with mock.patch.object(gr, "_gh", return_value="") as m:
+            gr.list_marker_comments("o/r", "5")
+        jq = m.call_args.args[0][m.call_args.args[0].index("--jq") + 1]
+        self.assertIn(json.dumps(gr.MARKER), jq)
+        self.assertIn(".user.login", jq)
+
+    def test_malformed_listing_lines_ignored(self):
+        with mock.patch.object(gr, "_gh", return_value="garbage\nabc\tx\n7\tgithub-actions[bot]\n"):
+            self.assertEqual(gr.list_marker_comments("o/r", "5"), [("7", "github-actions[bot]")])
 
     def test_temp_file_cleaned_up_even_on_failure(self):
         created = []
@@ -334,6 +392,16 @@ class TestMain(unittest.TestCase):
                 gr.main()
         up.assert_called_once()
         self.assertIn("CWE-89", up.call_args.args[2])
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_invalid_report_author_rejected(self):
+        path = self._findings_file([finding()])
+        with mock.patch.object(gr, "REPORT_AUTHOR", "x; rm -rf /"), \
+             mock.patch.object(gr, "upsert_pr_comment") as up, \
+             self.assertRaises(SystemExit) as ctx, \
+             mock.patch.object(sys, "argv", ["gemini_report.py", path]):
+            gr.main()
+        up.assert_not_called()
         self.assertEqual(ctx.exception.code, 1)
 
     def test_successful_call_exits_zero(self):

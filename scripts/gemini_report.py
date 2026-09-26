@@ -12,6 +12,11 @@ import urllib.error
 import urllib.request
 
 MARKER = "<!-- gemini-security-report -->"
+# Only a comment posted by this login is treated as ours. Anyone can post a
+# comment starting with MARKER, and without this check the bot would PATCH the
+# latest one - an attacker's - instead of its own. github.token posts as
+# github-actions[bot]; override when running locally or with an App token.
+REPORT_AUTHOR = os.environ.get("REPORT_COMMENT_AUTHOR", "github-actions[bot]")
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
@@ -161,9 +166,28 @@ def sanitize_report(text):
     return text.strip()
 
 
+# Scanner-derived values (file paths, rule ids) are attacker-influenceable on a
+# fork PR. Entity-encode everything markdown or HTML could act on: a raw
+# backtick breaks out of a code span, `|` splits the table row, `[..](..)`
+# renders a link, and `<`/`>` would start a tag. Entities are decoded only
+# after markdown parsing, so they display literally and cannot re-activate.
+_CELL_ESCAPES = {
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "|": "&#124;",
+    "`": "&#96;", "\\": "&#92;", "[": "&#91;", "]": "&#93;", "*": "&#42;",
+    "_": "&#95;", "~": "&#126;", "@": "&#64;", "#": "&#35;",
+}
+
+
 def _cell(text):
     """Escape a value for use inside a markdown table cell."""
-    return str(text).replace("|", "\\|").replace("\n", " ")
+    text = " ".join(str(text).split("\n")).replace("\r", " ")
+    return "".join(_CELL_ESCAPES.get(ch, ch) for ch in text)
+
+
+def _code_cell(text):
+    """Escaped value wrapped in <code>, which also stops GitHub from turning
+    an @name or #123 inside it into a mention or cross-reference."""
+    return f"<code>{_cell(text)}</code>"
 
 
 def build_appendix(findings):
@@ -185,7 +209,7 @@ def build_appendix(findings):
     sev_cells = " · ".join(
         f"**{s}** {by_sev[s]}" for s in SEVERITY_ORDER if s in by_sev
     ) or "none"
-    tool_cells = " · ".join(f"`{t}` {by_tool[t]}" for t in sorted(by_tool)) or "none"
+    tool_cells = " · ".join(f"`{_cell(t)}` {by_tool[t]}" for t in sorted(by_tool)) or "none"
 
     lines = [
         "---",
@@ -209,9 +233,9 @@ def build_appendix(findings):
     used = 0
     omitted = 0
     for f in findings:
-        loc = _cell(f["file"]) + (f":{f['line']}" if f.get("line") else "")
+        loc = f"{f['file']}:{f['line']}" if f.get("line") else f["file"]
         row = (f"| {_cell(f['severity'])} | {_cell(f['cwe'])} | {_cell(f['tool'])} "
-               f"| `{loc}` | {_cell(f['rule_id'])} |")
+               f"| {_code_cell(loc)} | {_code_cell(f['rule_id'])} |")
         if header_len + used + len(row) + 1 > APPENDIX_BUDGET:
             omitted += 1
             continue
@@ -260,13 +284,29 @@ def _gh(args, **kwargs):
     return result.stdout
 
 
+def list_marker_comments(repo, pr_number):
+    """Return (comment id, author login) for each PR comment starting with MARKER."""
+    # MARKER is a constant; json.dumps renders it as a valid jq string literal.
+    jq = f".[] | select(.body | startswith({json.dumps(MARKER)})) | [.id, .user.login] | @tsv"
+    out = _gh(["api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate", "--jq", jq])
+    comments = []
+    for line in out.splitlines():
+        comment_id, sep, login = line.strip().partition("\t")
+        if sep and comment_id.isdigit():
+            comments.append((comment_id, login))
+    return comments
+
+
+def find_report_comment(comments, author):
+    """Pick the latest marker comment written by `author`, ignoring anyone else's."""
+    ours = [cid for cid, login in comments if login == author]
+    return ours[-1] if ours else None
+
+
 def upsert_pr_comment(repo, pr_number, full_body):
     full_body = truncate_for_github(full_body)
 
-    existing = _gh([
-        "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate",
-        "--jq", '.[] | select(.body | startswith("<!-- gemini-security-report -->")) | .id',
-    ]).strip().splitlines()
+    comment_id = find_report_comment(list_marker_comments(repo, pr_number), REPORT_AUTHOR)
 
     body_file = None
     try:
@@ -274,8 +314,7 @@ def upsert_pr_comment(repo, pr_number, full_body):
             f.write(full_body)
             body_file = f.name
 
-        if existing:
-            comment_id = existing[-1].strip()
+        if comment_id:
             _gh(["api", f"repos/{repo}/issues/comments/{comment_id}", "-X", "PATCH",
                  "-F", f"body=@{body_file}"])
             log(f"updated existing comment {comment_id}")
@@ -324,6 +363,10 @@ def main():
         sys.exit(1)
     if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
         log(f"::error::GITHUB_REPOSITORY is not a valid owner/repo, got {repo!r}")
+        sys.exit(1)
+
+    if not re.fullmatch(r"[A-Za-z0-9-]+(\[bot\])?", REPORT_AUTHOR):
+        log(f"::error::REPORT_COMMENT_AUTHOR is not a valid GitHub login, got {REPORT_AUTHOR!r}")
         sys.exit(1)
 
     findings = load_findings(sys.argv[1])
