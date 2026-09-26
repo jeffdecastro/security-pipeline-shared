@@ -16,8 +16,11 @@ built in code. The narrative is a reading aid; the inventory is the record.
 See [why](#the-generated-inventory-why-the-model-is-not-trusted-for-completeness).
 
 It is currently exercised by [`jeffdecastro/DVWA`](https://github.com/jeffdecastro/DVWA)'s
-`security-scan.yml`, which runs Semgrep (SAST), Trivy (SCA), and OWASP ZAP
-(DAST) and calls this workflow to produce one combined comment.
+`security-scan.yml` (on feature branches, not yet on `master`), which runs
+Semgrep (SAST) and Trivy (SCA) plus a DAST scanner — Nuclei on
+`add-security-scan-workflow-v2`, OWASP ZAP on `test/dast-zap-pipeline` — and
+calls this workflow to produce one combined comment. `jeffdecastro/WebGoatJeff`
+is the other known caller.
 
 ---
 
@@ -115,7 +118,7 @@ flowchart TB
     end
 
     ART -.->|"gh run download\n(same run_id)"| FETCH
-    GR ==>|"uses: .../gemini-report.yml@main"| FETCH
+    GR ==>|"uses: .../gemini-report.yml@SHA"| FETCH
     FETCH <--> GH
     GEMINI <--> GAPI
     UPSERT --> GH
@@ -173,10 +176,10 @@ sequenceDiagram
     end
 
     GH->>GR: needs: [static-analysis, dynamic-scan] satisfied (always())
-    GR->>Shared: uses: gemini-report.yml@main (workflow_call)
+    GR->>Shared: uses: gemini-report.yml@SHA (workflow_call)
     activate Shared
 
-    Shared->>Shared: checkout jeffdecastro/security-pipeline-shared@main into _shared
+    Shared->>Shared: checkout jeffdecastro/security-pipeline-shared@shared_ref into _shared
     Shared->>GH: gh run download <run_id> --name semgrep-output
     Shared->>GH: gh run download <run_id> --name trivy-output
     Shared->>GH: gh run download <run_id> --name nuclei-results
@@ -212,13 +215,17 @@ in the code (see [`gemini_report.py`](scripts/gemini_report.py) and
 security-pipeline-shared/
 ├── .github/
 │   └── workflows/
-│       └── gemini-report.yml     # the reusable workflow (workflow_call)
+│       ├── gemini-report.yml     # the reusable workflow (workflow_call)
+│       └── test.yml              # CI: unit tests + CLI smoke test
 ├── scripts/
 │   ├── normalize.py              # SARIF / JSONL / tool-JSON -> common schema
 │   └── gemini_report.py          # prompt building, Gemini call, PR comment upsert
 ├── tests/
 │   ├── test_normalize.py         # parser, CWE, severity, dedupe, clamping tests
 │   └── test_gemini_report.py     # retry, sanitizer, budget, upsert tests
+├── docs/
+│   ├── CAPABILITIES.md           # architecture / extension-point map
+│   └── PLAN-scanning-and-analysis.md  # approved plan for SAST/SCA + analysis
 └── README.md                     # this file
 ```
 
@@ -382,7 +389,7 @@ Notes:
 
 ### Prompt contract
 
-The prompt sent to Gemini (`gemini-2.5-flash` by default, overridable via
+The prompt sent to Gemini (`gemini-flash-latest` by default, overridable via
 the `GEMINI_MODEL` env var) embeds the full normalized findings array and
 instructs the model to:
 
@@ -479,14 +486,20 @@ marker:
 On each run, `upsert_pr_comment`:
 
 1. Lists all comments on the PR (`gh api .../issues/{pr}/comments
-   --paginate`) and filters for ones whose body starts with the marker.
-2. If one or more exist, **PATCH**es the most recent (`existing[-1]`) in
-   place.
-3. Otherwise, **POST**s a new comment.
+   --paginate`) and keeps those whose body starts with the marker, along
+   with each comment's author login.
+2. Discards every marker comment **not written by the report's own login**
+   (`github-actions[bot]`, which is who `github.token` posts as; override
+   with the `REPORT_COMMENT_AUTHOR` env var when running locally or with a
+   GitHub App token). Anyone can post a comment that starts with the marker;
+   without this filter the bot would PATCH the latest one — an attacker's —
+   instead of its own.
+3. If one of ours exists, **PATCH**es the most recent in place.
+4. Otherwise, **POST**s a new comment.
 
 This makes the workflow safe to re-run on every push to a PR: the comment
 updates in place instead of accumulating duplicates. The comment body is
-written to a temp file and passed via `gh api -f body=@file` rather than
+written to a temp file and passed via `gh api -F body=@file` rather than
 inline, avoiding shell-escaping issues with arbitrary markdown/Gemini
 output.
 
@@ -494,7 +507,9 @@ output.
 
 ## How a calling repo wires this in
 
-Example, taken from [`WebGoatJeff`'s `security-scan.yml`](https://github.com/jeffdecastro/WebGoatJeff/blob/main/.github/workflows/security-scan.yml):
+Example, modelled on DVWA's `security-scan.yml` (branch
+`add-security-scan-workflow-v2`). Replace `<sha>` with the full commit SHA of
+the release you want and keep the tag in a comment:
 
 ```yaml
 jobs:
@@ -510,13 +525,14 @@ jobs:
     name: Gemini Report (dev-readable, risk-prioritized)
     if: always() && github.event_name == 'pull_request'
     needs: [static-analysis, dynamic-scan]
-    uses: jeffdecastro/security-pipeline-shared/.github/workflows/gemini-report.yml@main
+    uses: jeffdecastro/security-pipeline-shared/.github/workflows/gemini-report.yml@<sha> # v1.x.y
     permissions:
       contents: read
       pull-requests: write
     with:
       pr_number: ${{ github.event.pull_request.number }}
       artifact_manifest: "semgrep-sarif=semgrep-output,trivy-sarif=trivy-output,nuclei-jsonl=nuclei-results"
+      shared_ref: <sha>   # same SHA as the uses: line
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 ```
@@ -589,7 +605,7 @@ and check the Action run logs directly if you suspect it silently no-op'd.
 The trust boundary here is subtle. This workflow never executes the caller's
 code, but it does process data derived from it: scanner output quotes source
 snippets, file paths, and URLs from the pull request under review. On a fork
-PR, all of that is attacker-controlled. Three sinks matter.
+PR, all of that is attacker-controlled. Five sinks matter.
 
 **1. Artifact paths reaching a shell.** The `fetch` step discovers files
 inside downloaded artifacts with `find`, so those paths are attacker-shaped.
@@ -626,6 +642,18 @@ output is sanitized before posting.
 [Output sanitization](#output-sanitization) — the marker cannot be forged and
 active markup is stripped.
 
+**4. Scanner text reaching the PR comment directly.** The generated inventory
+is built from normalized findings, not model output, so `sanitize_report`
+never sees it. Its `file` and `rule_id` cells are scanner-derived. Every table
+cell is HTML-entity-encoded (`` ` `` `|` `<` `>` `[` `]` `*` `_` `~` `@` `#`
+`&` `\` `"`), and the location and rule cells are wrapped in `<code>`. A path
+containing a backtick can no longer close a code span and inject markdown, raw
+HTML renders as text, and an `@name`/`#123` in a rule id does not ping a user
+or cross-link an issue.
+
+**5. Comment ownership.** The upsert only ever edits a marker comment authored
+by the report's own login (see [Comment upsert](#comment-upsert)).
+
 Also addressed: the workflow declares `permissions: {}` at the top level,
 checkout uses `persist-credentials: false`, and a `concurrency` group
 serializes runs per PR so the comment upsert cannot race itself into
@@ -653,12 +681,12 @@ To support a new scanner (e.g. Bandit, Gitleaks, OWASP Dependency-Check):
 
 ## Known limitations
 
-- **`@main` pinning.** The example caller references this workflow via
-  `@main` rather than a pinned tag/SHA, so changes here take effect
-  immediately in downstream callers on their next run — there is currently
-  no versioned release process. The `shared_ref` input lets a caller pin the
-  *scripts*, but the `uses:` reference to the workflow itself still has to be
-  pinned by the caller.
+- **Pin by SHA.** Releases are tagged (`v1.0.0` = `ae4c89d`), but tags are
+  mutable. Callers should pin both the `uses:` reference and `shared_ref` to
+  a full commit SHA with the tag in a comment, as DVWA's
+  `add-security-scan-workflow-v2` branch does. A caller on `@main` picks up
+  every change here on its next run. The `shared_ref` input pins the
+  *scripts*; the `uses:` reference pins the workflow file itself — pin both.
 - **Truncation over chunking.** Very large findings sets are truncated to the
   prompt budget rather than chunked across multiple LLM calls and merged. The
   comment says so explicitly when it happens, but the long tail is dropped.
@@ -730,6 +758,11 @@ export PR_NUMBER=123
 export GH_TOKEN=$(gh auth token)
 python3 scripts/gemini_report.py normalized-findings.json
 ```
+
+When running locally with your own token, set
+`REPORT_COMMENT_AUTHOR=<your-login>` so the upsert recognizes the comment it
+posted last time; otherwise it only updates comments by `github-actions[bot]`
+and will POST a new one each run.
 
 Note that `gemini_report.py`'s `upsert_pr_comment` step will make real
 `gh api` calls against `GITHUB_REPOSITORY`/`PR_NUMBER` if you run it

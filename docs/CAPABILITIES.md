@@ -1,6 +1,14 @@
 # Capabilities map: security-pipeline-shared
 
 Written at commit `ae4c89d` (2026-07-20) on branch `claude/intelligent-clarke-ibv0u6`.
+Line numbers below refer to `ae4c89d`.
+
+> **Update (Stage 0 of `docs/PLAN-scanning-and-analysis.md`):**
+> - **Fixed:** the three §8.7 items about the appendix escaping, the
+>   marker-author lookup, and the literal marker in jq.
+> - **Corrected:** the §9 claims about versioning and callers, using what
+>   DVWA's workflow actually does.
+> - **Stale:** `gemini_report.py` line numbers after L160 have shifted.
 Every claim cites a file and line. Anything marked **(inferred)** was reasoned
 from the code but not run or confirmed. The test suite was run locally:
 62 tests pass on Python 3.11.15 (`python3 -m unittest discover -s tests`).
@@ -268,20 +276,21 @@ capability must respect the following.
 6. **Secrets.** The key is read from the environment, sent only in a header,
    and never logged (`README.md:552-560`).
 7. **Things to watch** (found while reading; not covered by tests):
-   - `build_appendix` output is **not** passed through `sanitize_report`
+   - **[Fixed in Stage 0]** `build_appendix` output is **not** passed through `sanitize_report`
      (`compose_body` only concatenates, `gemini_report.py:243`). Appendix
      cells contain scanner-derived `file` and `rule_id` values. `_cell`
      escapes only `|` and newlines (L164-166), so a backtick in a path can
      break out of the inline code span at L212-214, and raw HTML in `rule_id`
      is rendered as-is. GitHub's own HTML sanitizer limits the impact
      **(inferred)**.
-   - The upsert lookup matches **any** comment whose body starts with the
+   - **[Fixed in Stage 0: only comments by `REPORT_COMMENT_AUTHOR`, default
+     `github-actions[bot]`, are considered]** The upsert lookup matches **any** comment whose body starts with the
      marker, whoever wrote it (`gemini_report.py:266-269`), and PATCHes the
      latest one. Someone could post a comment starting with the marker to
      make the bot edit that comment instead of its own. Whether
      `github.token` may edit another user's comment was not verified
      **(inferred risk)**.
-   - The jq filter repeats the marker string literally instead of using
+   - **[Fixed in Stage 0]** The jq filter repeats the marker string literally instead of using
      `MARKER` (`gemini_report.py:268` vs L14). Changing one without the other
      breaks the upsert.
    - Artifact file size is unbounded. `normalize.py` reads each whole file
@@ -296,8 +305,9 @@ capability must respect the following.
   inventory, up to a 30k-char budget.
 - **Exact-match dedupe only**, on `(cwe, file, line, rule_id)` (`normalize.py:250`).
 - **Trivy findings always have `CWE-UNKNOWN`** (`README.md:367-370`).
-- **Only one output channel.** The PR comment is the only output: no SARIF
-  upload, no Checks annotations, no job summary, no stored artifact of
+- **Only one output channel.** The PR comment is the only output from *this
+  repo*: no SARIF upload (DVWA does its own code-scanning upload
+  caller-side), no Checks annotations, no job summary, no stored artifact of
   `normalized-findings.json`, no issue creation (`README.md:538-541`), no
   gating or exit status that reflects severity.
 - **No PR diff awareness.** Findings aren't filtered to changed files or
@@ -312,9 +322,11 @@ capability must respect the following.
 - **No workflow-level tests.** Bash in `gemini-report.yml` (validation, fetch,
   `find` patterns) is untested. `normalize.main()` is exercised only by the
   smoke test.
-- **Versioning.** Callers use `@main`. There are no tags or releases
-  (`README.md:653-659`), so any change reaches every caller on their next run.
-- **README drift.**
+- **Versioning.** *Corrected:* DVWA's newest branch
+  (`add-security-scan-workflow-v2`) pins this repo to SHA `ae4c89d`. Only the
+  older `test/dast-zap-pipeline` branch uses `@main`. As of Stage 0,
+  `v1.0.0` tags `ae4c89d`, and the README tells callers to pin by SHA.
+- **README drift** *(fixed in Stage 0)*.
   - The README says the default model is `gemini-2.5-flash`
     (`README.md:385`); the code uses `gemini-flash-latest`
     (`gemini_report.py:15`, changed in `33ca0fa`).

@@ -1,6 +1,13 @@
 # Plan: SAST + SCA scanning and a findings-analysis stage
 
-Status: **proposal, awaiting approval. No code has been written.**
+Status: **approved 2026-09-26 ("yes to all": every recommendation in §7).**
+
+| Stage | State |
+|---|---|
+| 0 Prerequisites | implemented, awaiting review |
+| 1 SAST | not started |
+| 2 SCA | not started |
+| 3 Analysis | not started. Needs the exact model id and your key's RPD/RPM (Q5), plus WebGoatJeff's ref (Q7) |
 Base: `ae4c89d` (+ `2d4f930`, which only adds `docs/CAPABILITIES.md`).
 
 Marking used throughout: **(verified)** means I read the source or ran it.
