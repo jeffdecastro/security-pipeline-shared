@@ -1,0 +1,137 @@
+name: Semgrep SAST (reusable)
+
+# Called by downstream repos to run Semgrep Community Edition over the caller's
+# checkout and upload the SARIF as an artifact for gemini-report.yml to read
+# via artifact_manifest ("semgrep-sarif=<artifact_name>").
+#
+# Deliberately isolated: this job gets contents: read and NO secrets. A
+# compromised or misbehaving scanner image can read the checkout it was handed
+# and nothing else - it never sees GEMINI_API_KEY or a token that can write to
+# the PR. Keep it that way: never add a secrets: block or a write permission
+# here. Code-scanning upload (security-events: write) stays in the caller.
+#
+# Never fails the caller's build: the scan step is continue-on-error, and a
+# scan-status.json records whether Semgrep actually ran so the report can say
+# "semgrep failed" instead of a false "no findings".
+
+on:
+  workflow_call:
+    inputs:
+      semgrep_configs:
+        description: >
+          Comma-separated Semgrep registry rulesets, e.g. "p/php,p/security-audit".
+          Registry packs only (p/<name>); at most 10.
+        required: false
+        type: string
+        default: p/default
+      artifact_name:
+        description: Name of the uploaded artifact (use it in gemini-report's artifact_manifest).
+        required: false
+        type: string
+        default: semgrep-output
+
+permissions: {}
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Validate inputs
+        env:
+          SEMGREP_CONFIGS: ${{ inputs.semgrep_configs }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          # Registry packs only: no local paths (PR-controlled), no URLs, no
+          # single r/ rules, nothing that could be read as a flag.
+          # validate:semgrep_configs
+          if ! [[ "$SEMGREP_CONFIGS" =~ ^p/[a-z0-9-]{1,64}(,p/[a-z0-9-]{1,64}){0,9}$ ]]; then
+            echo "::error::invalid semgrep_configs: '$SEMGREP_CONFIGS'"
+            exit 1
+          fi
+          # Must start alphanumeric: "." or ".." would pass a plain charset
+          # check and resolve to a parent directory wherever it is used as one.
+          # validate:artifact_name
+          if ! [[ "$ARTIFACT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+            echo "::error::invalid artifact_name: '$ARTIFACT_NAME'"
+            exit 1
+          fi
+
+      - name: Checkout caller repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: src
+          persist-credentials: false
+
+      - name: Run Semgrep
+        id: scan
+        continue-on-error: true
+        env:
+          SEMGREP_CONFIGS: ${{ inputs.semgrep_configs }}
+        run: |
+          set -euo pipefail
+          mkdir -p _out
+          # The container may not run as the runner's uid.
+          chmod 777 _out
+          config_args=()
+          IFS=',' read -ra CONFIGS <<< "$SEMGREP_CONFIGS"
+          for c in "${CONFIGS[@]}"; do
+            config_args+=(--config "$c")
+          done
+
+          # semgrep/semgrep 1.169.0 - the same digest DVWA validated live.
+          # Source mounted read-only; --metrics=off keeps rule telemetry off.
+          # --no-git-ignore: the checkout is mounted into a container whose
+          # uid does not own it, so git-based file listing is unreliable.
+          set +e
+          docker run --rm \
+            --platform linux/amd64 \
+            -v "$PWD/src:/src:ro" \
+            -v "$PWD/_out:/out" \
+            -w /src \
+            semgrep/semgrep@sha256:2b33f46ba66cf8cc2ad59ccfa7d22951fd00c632c38f1339e84ec8e6e641a942 \
+            semgrep scan \
+              --metrics=off \
+              --no-git-ignore \
+              --sarif \
+              --output=/out/semgrep.sarif \
+              "${config_args[@]}" \
+              .
+          rc=$?
+          set -e
+
+          # Exit 0 means the scan completed (findings or not; --error is not
+          # passed). Anything else is a failed scan. rc is an integer and the
+          # rest is constant, so this printf cannot be injected into.
+          sarif=false
+          [ -s _out/semgrep.sarif ] && sarif=true
+          printf '{"tool":"semgrep","exit_code":%d,"sarif":%s}\n' "$rc" "$sarif" > _out/scan-status.json
+          cat _out/scan-status.json
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::semgrep exited $rc; the report will show this scanner as failed"
+          fi
+
+      - name: Record scan failure
+        if: steps.scan.outcome != 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p _out
+          # The scan step itself errored before writing a status (e.g. image
+          # pull failure); make sure the report still hears about it.
+          if [ ! -s _out/scan-status.json ]; then
+            printf '{"tool":"semgrep","exit_code":-1,"sarif":false}\n' > _out/scan-status.json
+          fi
+
+      - name: Upload Semgrep artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: |
+            _out/semgrep.sarif
+            _out/scan-status.json
+          if-no-files-found: warn

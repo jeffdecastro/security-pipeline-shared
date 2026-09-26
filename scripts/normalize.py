@@ -276,21 +276,101 @@ def read_args_file(path):
     return [entry for entry in raw.split("\0") if entry.strip()]
 
 
+# States the workflow's fetch step can record for a manifest entry, plus
+# "failed", which only a scan-status.json with a non-zero exit can produce.
+FETCH_STATES = {"ok", "empty", "missing"}
+STATUS_RE = re.compile(r"[a-z0-9-]{1,64}")
+ARTIFACT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def read_status_file(path):
+    """Read a scan-status.json written by one of this repo's scan workflows.
+
+    Returns {"tool", "exit_code"} or None. The file travels inside an
+    artifact, so everything in it is validated rather than trusted.
+    """
+    try:
+        data = _load_json(path)
+    except (OSError, ValueError) as e:
+        print(f"::warning::ignoring unreadable scan status {path}: {e}", file=sys.stderr)
+        return None
+    code = data.get("exit_code")
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None
+    tool = _clean(data.get("tool"), 64)
+    return {"tool": tool if STATUS_RE.fullmatch(tool or "") else "", "exit_code": code}
+
+
+def summarize_scan_status(entries):
+    """Turn fetch-step records into one status row per manifest entry.
+
+    Each entry is "<parser-key>=<artifact>=<state>=<status-file-or-empty>".
+    A scanner that exited non-zero is "failed" even if it left partial
+    output, so the report never presents a crashed scan as a clean one.
+    """
+    rows = []
+    for entry in entries:
+        parts = entry.split("=", 3)
+        if len(parts) != 4:
+            print(f"::warning::ignoring malformed status record {entry[:80]!r}", file=sys.stderr)
+            continue
+        key, artifact, state, status_path = parts
+        if not (STATUS_RE.fullmatch(key) and ARTIFACT_RE.fullmatch(artifact)
+                and state in FETCH_STATES):
+            print(f"::warning::ignoring invalid status record {entry[:80]!r}", file=sys.stderr)
+            continue
+        row = {"parser": key, "artifact": artifact, "state": state, "tool": "", "exit_code": None}
+        if status_path and Path(status_path).is_file():
+            status = read_status_file(status_path)
+            if status:
+                row["tool"] = status["tool"]
+                row["exit_code"] = status["exit_code"]
+                if status["exit_code"] != 0:
+                    row["state"] = "failed"
+        rows.append(row)
+    return rows
+
+
 def main():
     """Args: pairs of <parser-key>=<file-path>, or --args-file <nul-delimited-file>.
 
+    Optionally --status-args-file <nul-delimited-file> --status-out <path>
+    writes a per-artifact scanner status summary alongside the findings.
     Writes the normalized findings JSON array to stdout.
     """
     argv = sys.argv[1:]
-    if argv and argv[0] == "--args-file":
-        if len(argv) != 2:
-            print("usage: normalize.py --args-file <path>", file=sys.stderr)
+    options = {}
+    while argv and argv[0] in ("--args-file", "--status-args-file", "--status-out"):
+        if len(argv) < 2:
+            print("usage: normalize.py [--args-file <path>] "
+                  "[--status-args-file <path> --status-out <path>] [key=path ...]", file=sys.stderr)
+            sys.exit(2)
+        options[argv[0]] = argv[1]
+        argv = argv[2:]
+    if ("--status-args-file" in options) != ("--status-out" in options):
+        print("usage: --status-args-file and --status-out must be given together", file=sys.stderr)
+        sys.exit(2)
+
+    if "--args-file" in options:
+        if argv:
+            print("usage: normalize.py --args-file <path> takes no key=path arguments", file=sys.stderr)
             sys.exit(2)
         try:
-            argv = read_args_file(argv[1])
+            argv = read_args_file(options["--args-file"])
         except OSError as e:
-            print(f"::warning::cannot read args file {argv[1]}: {e}", file=sys.stderr)
+            print(f"::warning::cannot read args file {options['--args-file']}: {e}", file=sys.stderr)
             argv = []
+
+    if "--status-args-file" in options:
+        try:
+            status_entries = read_args_file(options["--status-args-file"])
+        except OSError as e:
+            print(f"::warning::cannot read status args file: {e}", file=sys.stderr)
+            status_entries = []
+        rows = summarize_scan_status(status_entries)
+        Path(options["--status-out"]).write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+        for row in rows:
+            print(f"scanner status: {row['artifact']} ({row['parser']}) {row['state']}", file=sys.stderr)
 
     all_findings = []
     for arg in argv:

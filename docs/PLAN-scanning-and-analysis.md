@@ -4,8 +4,8 @@ Status: **approved 2026-09-26 ("yes to all": every recommendation in §7).**
 
 | Stage | State |
 |---|---|
-| 0 Prerequisites | implemented, awaiting review |
-| 1 SAST | not started |
+| 0 Prerequisites | merged (PR #6, `05d28e6`) |
+| 1 SAST | implemented, awaiting review (see §3.1.6 for what changed from this plan) |
 | 2 SCA | not started |
 | 3 Analysis | not started. Model default decided (see Q5 below, pending one check against your key). Still needs WebGoatJeff's ref (Q7) |
 Base: `ae4c89d` (+ `2d4f930`, which only adds `docs/CAPABILITIES.md`).
@@ -230,6 +230,49 @@ today.
   in a Python helper used only by tests, which matches the existing
   double-validation convention.
 - **No parser changes.** Existing `TestSarifParser` coverage applies.
+
+#### 3.1.6 As built (differences from this plan)
+
+- **Fixture location.** The fixture is at `ci/scan-target/`, not
+  `tests/fixtures/`. Semgrep's built-in `.semgrepignore` skips `tests/`,
+  `test/`, `vendor/`, `node_modules/`, `build/` and `dist/` (verified
+  empirically), so a fixture under `tests/` is never scanned. Callers
+  inherit the same default. It's documented in the README.
+- **Scanner status is wired end to end.**
+  - The fetch step records `ok`/`empty`/`missing` for every manifest entry
+    and keeps `scan-status.json` out of the parser queue.
+  - `normalize.py --status-args-file/--status-out` writes
+    `scan-status-summary.json`, where a non-zero exit becomes `failed`.
+  - `gemini_report.py` takes that file as an optional second argument and
+    prints a **Scanners:** line.
+  - An empty finding set with a failed or missing scanner no longer posts
+    "No security findings".
+  - The missing and empty states also cover caller-run scanners, not only this
+    repo's.
+- **Tighter artifact-name validation (pre-existing gap).** The old manifest
+  charset `[A-Za-z0-9._-]+` accepted `..`, which becomes
+  `_scanner_output/..`, the workspace root. Names must now start
+  alphanumeric, in `gemini-report.yml`, `sast-semgrep.yml`, and both scripts.
+- **Workflow tests** (`tests/test_workflows.py`, new) enforce:
+  - SHA/digest pinning;
+  - no `${{ }}` in `run:` blocks;
+  - that the scan job has no secrets and is read-only;
+  - the real validation regexes, run through bash;
+  - the real fetch step, driven against a fake `gh`.
+
+  Mutation-checked: injecting each violation fails the matching test.
+- **Semgrep version.** Pinned to 1.169.0 by the digest DVWA validated live.
+  1.178.0 is current. Bumping is a separate, deliberate change.
+- **Verified locally:** Semgrep 1.169.0 on the fixture, using the
+  `semgrep-rules` repo because semgrep.dev is blocked from the dev
+  environment. The real SARIF went through the unchanged `semgrep-sarif`
+  parser and gave `CWE-89` for both files. The integration job's check script
+  was run against that output.
+- **Not verified live.** GitHub Actions created no runs for PR #6 or the
+  merge to `main`, so the `sast-integration` job has never executed on a
+  runner. Registry access (`p/php,p/java` with `--metrics=off`) and
+  container permissions (`chmod 777 _out`) are therefore unproven until
+  Actions runs again.
 
 ### 3.2 Stage 2: SCA with Trivy
 
@@ -732,8 +775,12 @@ do for free:
 That's the 80%, at zero requests.
 
 What the model adds on top is weaker than it sounds. **It never sees source
-code.** This workflow deliberately only reads artifacts, and Semgrep CE's
-SARIF may not include snippet text without a login **(inferred)**. So its
+code**, because this workflow deliberately only reads artifacts.
+*Correction (Stage 1, verified):* Semgrep CE 1.169.0's SARIF does include
+the matched line in `region.snippet.text` without a login. Stage 3 could
+therefore send one snippet per class sample, which would make its
+false-positive verdicts more than guesses. That's a deliberate expansion of
+what reaches the model, to decide at Stage 3. Without snippets, its
 "likely false positive" and "exploitable in context" verdicts are priors
 about a rule name and a file path, not analysis. It will sound confident
 anyway. The honest version of Stage 3 is deterministic grouping plus

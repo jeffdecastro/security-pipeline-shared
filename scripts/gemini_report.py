@@ -190,7 +190,68 @@ def _code_cell(text):
     return f"<code>{_cell(text)}</code>"
 
 
-def build_appendix(findings):
+# Per-artifact states from normalize.py's scan-status summary.
+SCAN_STATES = {"ok", "empty", "missing", "failed"}
+_STATUS_KEY_RE = re.compile(r"[a-z0-9-]{1,64}")
+_STATUS_ARTIFACT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def load_scan_status(path):
+    """Load normalize.py's scanner status summary; [] if absent or invalid.
+
+    Absent is the normal case for callers on an older workflow, so it is not
+    an error. Rows that fail validation are dropped rather than rendered.
+    """
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"::warning::{path} is not valid JSON ({e}); scanner status not shown")
+        return []
+    if not isinstance(data, list):
+        return []
+    rows = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        code = row.get("exit_code")
+        if isinstance(code, bool) or not (code is None or isinstance(code, int)):
+            continue
+        if (_STATUS_KEY_RE.fullmatch(str(row.get("parser", "")))
+                and _STATUS_ARTIFACT_RE.fullmatch(str(row.get("artifact", "")))
+                and row.get("state") in SCAN_STATES):
+            rows.append({"parser": row["parser"], "artifact": row["artifact"],
+                         "state": row["state"], "exit_code": code})
+    return rows
+
+
+def scan_incomplete(statuses):
+    """True when any expected scanner output is missing, empty, or failed."""
+    return any(s["state"] != "ok" for s in statuses)
+
+
+def render_scan_status(statuses):
+    """One line naming every scanner artifact and whether it produced results."""
+    if not statuses:
+        return ""
+    labels = {"ok": "ran", "empty": "**no output**", "missing": "**artifact missing**"}
+    parts = []
+    for s in statuses:
+        if s["state"] == "failed":
+            code = s["exit_code"]
+            label = ("**failed (did not run)**" if code is not None and code < 0
+                     else f"**failed (exit {code})**")
+        else:
+            label = labels[s["state"]]
+        parts.append(f"`{_cell(s['artifact'])}` {label}")
+    return "Scanners: " + " · ".join(parts)
+
+
+def build_appendix(findings, statuses=()):
     """Render a complete, deterministic inventory of every finding.
 
     The LLM decides what to feature in its narrative, and in practice it drops
@@ -222,6 +283,14 @@ def build_appendix(findings):
         "",
         f"By tool: {tool_cells}",
         "",
+    ]
+    status_line = render_scan_status(statuses)
+    if status_line:
+        lines.extend([status_line, ""])
+        if scan_incomplete(statuses):
+            lines.extend(["**Warning:** not every scanner produced results, so this "
+                          "inventory may be incomplete.", ""])
+    lines += [
         "<details>",
         "<summary>Full finding list</summary>",
         "",
@@ -330,6 +399,18 @@ def upsert_pr_comment(repo, pr_number, full_body):
                 pass
 
 
+def no_findings_body(statuses):
+    """Comment for an empty finding set that never reads as an all-clear when
+    a scanner failed or its output never arrived."""
+    status_line = render_scan_status(statuses)
+    if scan_incomplete(statuses):
+        return (f"{MARKER}\n### No findings reported, but not every scanner produced results\n\n"
+                f"{status_line}\n\nThis is not an all-clear: check the scanner jobs in this "
+                f"workflow run.")
+    body = f"{MARKER}\n### No security findings to report for this PR."
+    return f"{body}\n\n{status_line}" if status_line else body
+
+
 def load_findings(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -347,8 +428,8 @@ def load_findings(path):
 
 
 def main():
-    if len(sys.argv) != 2:
-        log("usage: gemini_report.py <normalized-findings.json>")
+    if len(sys.argv) not in (2, 3):
+        log("usage: gemini_report.py <normalized-findings.json> [<scan-status-summary.json>]")
         sys.exit(2)
 
     missing = [v for v in ("GITHUB_REPOSITORY", "PR_NUMBER") if not os.environ.get(v)]
@@ -370,13 +451,13 @@ def main():
         sys.exit(1)
 
     findings = load_findings(sys.argv[1])
+    statuses = load_scan_status(sys.argv[2] if len(sys.argv) == 3 else None)
 
     if not findings:
-        upsert_pr_comment(repo, pr_number,
-                          f"{MARKER}\n### No security findings to report for this PR.")
+        upsert_pr_comment(repo, pr_number, no_findings_body(statuses))
         return
 
-    appendix = build_appendix(findings)
+    appendix = build_appendix(findings, statuses)
     api_key = os.environ.get("GEMINI_API_KEY")
     exit_code = 0
 

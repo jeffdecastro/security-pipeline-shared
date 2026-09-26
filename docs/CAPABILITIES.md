@@ -9,6 +9,14 @@ Line numbers below refer to `ae4c89d`.
 > - **Corrected:** the §9 claims about versioning and callers, using what
 >   DVWA's workflow actually does.
 > - **Stale:** `gemini_report.py` line numbers after L160 have shifted.
+>
+> **Update (Stage 1):**
+> - **New capability:** an opt-in `sast-semgrep.yml` reusable workflow,
+>   isolated and read-only.
+> - **New capability:** per-artifact scanner status (ok, empty, missing,
+>   failed), shown in every report.
+> - **New tests:** `tests/test_workflows.py`.
+> - See `README.md` and plan §3.1.6.
 Every claim cites a file and line. Anything marked **(inferred)** was reasoned
 from the code but not run or confirmed. The test suite was run locally:
 62 tests pass on Python 3.11.15 (`python3 -m unittest discover -s tests`).

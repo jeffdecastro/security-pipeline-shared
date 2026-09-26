@@ -263,5 +263,97 @@ class TestArgsFile(unittest.TestCase):
             self.assertEqual(normalize.read_args_file(write(d, "args.txt", "")), [])
 
 
+
+class TestScanStatus(unittest.TestCase):
+    """The workflow records one status per manifest entry so a scanner that
+    crashed or never uploaded is reported, not silently read as "no findings"."""
+
+    def test_fetch_states_pass_through(self):
+        rows = normalize.summarize_scan_status([
+            "semgrep-sarif=semgrep-output=ok=", "trivy-sarif=trivy-output=missing=",
+            "zap-json=zap-output=empty=",
+        ])
+        self.assertEqual([(r["artifact"], r["state"]) for r in rows],
+                         [("semgrep-output", "ok"), ("trivy-output", "missing"), ("zap-output", "empty")])
+
+    def test_nonzero_exit_marks_failed_even_with_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            status = write(d, "scan-status.json", {"tool": "semgrep", "exit_code": 2, "sarif": True})
+            row = normalize.summarize_scan_status([f"semgrep-sarif=semgrep-output=ok={status}"])[0]
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["exit_code"], 2)
+        self.assertEqual(row["tool"], "semgrep")
+
+    def test_zero_exit_keeps_fetch_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            status = write(d, "scan-status.json", {"tool": "semgrep", "exit_code": 0, "sarif": True})
+            row = normalize.summarize_scan_status([f"semgrep-sarif=semgrep-output=ok={status}"])[0]
+        self.assertEqual((row["state"], row["exit_code"]), ("ok", 0))
+
+    def test_status_path_containing_equals_sign(self):
+        # Only the first three '=' separate fields; the path is the remainder.
+        with tempfile.TemporaryDirectory() as d:
+            sub = Path(d) / "a=b"
+            sub.mkdir()
+            status = write(str(sub), "scan-status.json", {"tool": "semgrep", "exit_code": 1})
+            row = normalize.summarize_scan_status([f"semgrep-sarif=semgrep-output=ok={status}"])[0]
+        self.assertEqual(row["state"], "failed")
+
+    def test_untrusted_status_file_contents_validated(self):
+        with tempfile.TemporaryDirectory() as d:
+            for bad in ({"exit_code": True}, {"exit_code": "2"}, [1, 2], "not json"):
+                status = write(d, "scan-status.json", bad)
+                row = normalize.summarize_scan_status([f"semgrep-sarif=s=ok={status}"])[0]
+                self.assertEqual((row["state"], row["exit_code"]), ("ok", None), bad)
+            status = write(d, "scan-status.json", {"tool": "::error::x\ny", "exit_code": 0})
+            self.assertEqual(normalize.read_status_file(status)["tool"], "")
+
+    def test_malformed_and_invalid_records_dropped(self):
+        rows = normalize.summarize_scan_status([
+            "no-separators", "semgrep-sarif=ok=", "BAD KEY=a=ok=", "k=../../etc=ok=",
+            "k=a=exploded=", "k=a=failed=",  # failed only comes from a status file
+            "k=good=ok=",
+        ])
+        self.assertEqual([r["artifact"] for r in rows], ["good"])
+
+    def test_missing_status_file_path_ignored(self):
+        row = normalize.summarize_scan_status(["k=a=ok=/nonexistent/scan-status.json"])[0]
+        self.assertEqual((row["state"], row["exit_code"]), ("ok", None))
+
+
+class TestCli(unittest.TestCase):
+    SCRIPT = str(Path(__file__).resolve().parent.parent / "scripts" / "normalize.py")
+
+    def run_cli(self, *args):
+        import subprocess
+        return subprocess.run([sys.executable, self.SCRIPT, *args],
+                              capture_output=True, text=True)
+
+    def test_status_summary_written_alongside_findings(self):
+        with tempfile.TemporaryDirectory() as d:
+            sarif = write(d, "s.sarif", {"runs": []})
+            args = write(d, "args.txt", f"semgrep-sarif={sarif}\0")
+            status = write(d, "scan-status.json", {"tool": "semgrep", "exit_code": 2})
+            status_args = write(d, "status.txt", f"semgrep-sarif=semgrep-output=ok={status}\0"
+                                                 f"trivy-sarif=trivy-output=missing=\0")
+            out = str(Path(d) / "summary.json")
+            r = self.run_cli("--args-file", args, "--status-args-file", status_args, "--status-out", out)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(json.loads(r.stdout), [])
+            summary = json.loads(Path(out).read_text())
+        self.assertEqual([(x["artifact"], x["state"]) for x in summary],
+                         [("semgrep-output", "failed"), ("trivy-output", "missing")])
+
+    def test_old_invocation_still_works(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = write(d, "args.txt", "")
+            r = self.run_cli("--args-file", args)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "[]"))
+
+    def test_status_flags_must_be_paired(self):
+        r = self.run_cli("--status-out", "x.json")
+        self.assertEqual(r.returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

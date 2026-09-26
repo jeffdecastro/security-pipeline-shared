@@ -57,10 +57,13 @@ jobs:
           fi
           # Every manifest entry must be <key>=<artifact-name> using a
           # conservative charset. This input reaches `gh run download --name`,
-          # so reject anything that could be read as a flag or a path.
+          # so reject anything that could be read as a flag or a path. The
+          # artifact name must start alphanumeric: it also becomes a directory
+          # (_scanner_output/<name>), and ".." would escape it.
           IFS=',' read -ra PAIRS <<< "$MANIFEST"
           for pair in "${PAIRS[@]}"; do
-            if ! [[ "$pair" =~ ^[a-z0-9-]+=[A-Za-z0-9._-]+$ ]]; then
+            # validate:artifact_manifest_entry
+            if ! [[ "$pair" =~ ^[a-z0-9-]+=[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
               echo "::error::invalid artifact_manifest entry: '$pair'"
               exit 1
             fi
@@ -89,6 +92,10 @@ jobs:
           # NUL-delimited so paths containing spaces/newlines/metacharacters
           # survive intact. Never interpolate these into a shell command line.
           : > parser_args.txt
+          # One <key>=<artifact>=<state>=<status-file> record per manifest
+          # entry, so the report can say which scanners ran, failed, or
+          # produced nothing instead of silently omitting them.
+          : > scan_status_args.txt
 
           IFS=',' read -ra PAIRS <<< "$MANIFEST"
           for pair in "${PAIRS[@]}"; do
@@ -99,8 +106,19 @@ jobs:
 
             if ! gh run download "$RUN_ID" --repo "$REPO" --name "$artifact" --dir "$dest"; then
               echo "::warning::artifact '$artifact' not available in run $RUN_ID; skipping"
+              printf '%s=%s=missing=\0' "$key" "$artifact" >> scan_status_args.txt
               continue
             fi
+
+            # A scan-status.json (written by this repo's scan workflows) is
+            # status, not findings: keep it out of the parser queue.
+            # (A read loop, not `| head`: under pipefail an early-exiting head
+            # can SIGPIPE sort and fail the step.)
+            status_file=""
+            while IFS= read -r -d '' f; do
+              status_file="$f"
+              break
+            done < <(find "$dest" -type f -name 'scan-status.json' -print0 | sort -z)
 
             # Artifacts can bundle a human-readable report (.html) alongside the
             # machine-readable one (.json/.sarif/.jsonl) - always prefer the
@@ -109,13 +127,16 @@ jobs:
             while IFS= read -r -d '' file; do
               printf '%s=%s\0' "$key" "$file" >> parser_args.txt
               found=$((found + 1))
-            done < <(find "$dest" -type f \( -name '*.json' -o -name '*.sarif' -o -name '*.jsonl' \) -print0 | sort -z)
+            done < <(find "$dest" -type f \( -name '*.json' -o -name '*.sarif' -o -name '*.jsonl' \) ! -name 'scan-status.json' -print0 | sort -z)
 
             if [ "$found" -eq 0 ]; then
               echo "::warning::no machine-readable file found in artifact '$artifact'"
+              state=empty
             else
               echo "queued $found file(s) from '$artifact' for parser '$key'"
+              state=ok
             fi
+            printf '%s=%s=%s=%s\0' "$key" "$artifact" "$state" "$status_file" >> scan_status_args.txt
           done
 
       - name: Set up Python
@@ -127,8 +148,10 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          touch parser_args.txt
-          python3 _shared/scripts/normalize.py --args-file parser_args.txt > normalized-findings.json
+          touch parser_args.txt scan_status_args.txt
+          python3 _shared/scripts/normalize.py --args-file parser_args.txt \
+            --status-args-file scan_status_args.txt --status-out scan-status-summary.json \
+            > normalized-findings.json
           echo "--- normalized findings (first 200 lines) ---"
           head -n 200 normalized-findings.json
 
@@ -139,4 +162,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python3 _shared/scripts/gemini_report.py normalized-findings.json
+        run: python3 _shared/scripts/gemini_report.py normalized-findings.json scan-status-summary.json

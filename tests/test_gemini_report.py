@@ -260,6 +260,67 @@ class TestAppendix(unittest.TestCase):
         self.assertIn("a &#124; INJECTED", row)
 
 
+class TestScanStatus(unittest.TestCase):
+    """Once this repo runs scanners, a failed scan must never read as an
+    all-clear: a crashed Semgrep yields an empty finding set, which used to
+    post "No security findings to report"."""
+
+    OK = {"parser": "semgrep-sarif", "artifact": "semgrep-output", "state": "ok", "exit_code": 0}
+    FAILED = {"parser": "trivy-json", "artifact": "trivy-results", "state": "failed", "exit_code": 2}
+    MISSING = {"parser": "nuclei-jsonl", "artifact": "nuclei-results", "state": "missing", "exit_code": None}
+
+    def _write(self, data):
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        f.write(data if isinstance(data, str) else json.dumps(data))
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_no_findings_with_failed_scanner_is_not_an_all_clear(self):
+        body = gr.no_findings_body([self.OK, self.FAILED])
+        self.assertNotIn("No security findings to report", body)
+        self.assertIn("not every scanner produced results", body)
+        self.assertIn("`trivy-results` **failed (exit 2)**", body)
+        self.assertTrue(body.startswith(gr.MARKER))
+
+    def test_no_findings_all_scanners_ran(self):
+        body = gr.no_findings_body([self.OK])
+        self.assertIn("No security findings to report", body)
+        self.assertIn("`semgrep-output` ran", body)
+
+    def test_no_findings_without_status_is_unchanged(self):
+        # Callers on an older workflow produce no status summary.
+        self.assertEqual(gr.no_findings_body([]),
+                         f"{gr.MARKER}\n### No security findings to report for this PR.")
+
+    def test_appendix_names_failed_and_missing_scanners(self):
+        appendix = gr.build_appendix([finding()], [self.OK, self.FAILED, self.MISSING])
+        self.assertIn("`nuclei-results` **artifact missing**", appendix)
+        self.assertIn("`trivy-results` **failed (exit 2)**", appendix)
+        self.assertIn("may be incomplete", appendix)
+
+    def test_appendix_all_ok_has_no_warning(self):
+        appendix = gr.build_appendix([finding()], [self.OK])
+        self.assertIn("Scanners: `semgrep-output` ran", appendix)
+        self.assertNotIn("may be incomplete", appendix)
+
+    def test_did_not_run_label(self):
+        line = gr.render_scan_status([dict(self.FAILED, exit_code=-1)])
+        self.assertIn("**failed (did not run)**", line)
+
+    def test_load_validates_rows(self):
+        path = self._write([self.OK, {"parser": "x", "artifact": "<img>", "state": "ok"},
+                            {"parser": "x", "artifact": "a", "state": "bogus"},
+                            dict(self.OK, exit_code="2"), dict(self.OK, exit_code=True), "junk"])
+        self.assertEqual(gr.load_scan_status(path), [self.OK])
+
+    def test_load_tolerates_absent_or_broken_file(self):
+        self.assertEqual(gr.load_scan_status(None), [])
+        self.assertEqual(gr.load_scan_status("/nonexistent.json"), [])
+        self.assertEqual(gr.load_scan_status(self._write("{not json")), [])
+        self.assertEqual(gr.load_scan_status(self._write({"a": 1})), [])
+
+
 class TestComposeBody(unittest.TestCase):
     def test_appendix_survives_when_narrative_is_oversized(self):
         findings = [{"tool": "zap", "cwe": "CWE-693", "severity": "LOW",
@@ -393,6 +454,15 @@ class TestMain(unittest.TestCase):
         up.assert_called_once()
         self.assertIn("CWE-89", up.call_args.args[2])
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_status_file_argument_reaches_the_comment(self):
+        path = self._findings_file([])
+        status = self._findings_file([{"parser": "semgrep-sarif", "artifact": "semgrep-output",
+                                       "state": "failed", "exit_code": 2}])
+        with mock.patch.object(gr, "upsert_pr_comment") as up, \
+             mock.patch.object(sys, "argv", ["gemini_report.py", path, status]):
+            gr.main()
+        self.assertIn("not every scanner produced results", up.call_args.args[2])
 
     def test_invalid_report_author_rejected(self):
         path = self._findings_file([finding()])
